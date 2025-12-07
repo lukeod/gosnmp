@@ -11,6 +11,7 @@ package gosnmp
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"fmt"
 	"math"
 	"math/big"
@@ -20,6 +21,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/pion/dtls/v3"
 )
 
 const (
@@ -162,6 +165,14 @@ type GoSNMP struct {
 
 	// ContextName is SNMPV3 ContextName in ScopedPDU
 	ContextName string
+
+	// TLSConfig specifies TLS configuration for Transport="tls".
+	// Required when using TLS transport with TransportSecurityModel.
+	TLSConfig *tls.Config
+
+	// DTLSConfig specifies DTLS configuration for Transport="dtls".
+	// Required when using DTLS transport with TransportSecurityModel.
+	DTLSConfig *dtls.Config
 
 	// Internal - used to sync requests to responses - snmpv3.
 	msgID uint32
@@ -370,6 +381,69 @@ func (x *GoSNMP) netConnect() error {
 		if addr4 := localAddr.(*net.TCPAddr).IP.To4(); addr4 != nil {
 			x.Transport = "tcp4"
 		}
+	case "dtls", "dtls4", "dtls6":
+		if x.DTLSConfig == nil {
+			return fmt.Errorf("DTLSConfig required for dtls transport")
+		}
+		// Map dtls to udp for underlying network
+		udpNetwork := "udp4"
+		if x.Transport == "dtls6" {
+			udpNetwork = "udp6"
+		}
+		udpAddr, err := net.ResolveUDPAddr(udpNetwork, addr)
+		if err != nil {
+			return err
+		}
+		// pion/dtls uses FlightInterval for retransmission timeout
+		// Set a reasonable default if not configured
+		if x.DTLSConfig.FlightInterval == 0 {
+			x.DTLSConfig.FlightInterval = x.Timeout / 4
+			if x.DTLSConfig.FlightInterval < 100*time.Millisecond {
+				x.DTLSConfig.FlightInterval = 100 * time.Millisecond
+			}
+		}
+		conn, err := dtls.Dial(udpNetwork, udpAddr, x.DTLSConfig)
+		if err != nil {
+			return err
+		}
+		// Perform DTLS handshake with context for timeout/cancellation
+		if err := conn.HandshakeContext(x.Context); err != nil {
+			conn.Close()
+			return fmt.Errorf("DTLS handshake failed: %w", err)
+		}
+		x.Conn = conn
+		return nil
+	case "tls", "tls4", "tls6":
+		if x.TLSConfig == nil {
+			return fmt.Errorf("TLSConfig required for tls transport")
+		}
+		// Enforce RFC 9456 minimum - error if explicitly insecure, default if unset
+		if x.TLSConfig.MinVersion != 0 && x.TLSConfig.MinVersion < tls.VersionTLS12 {
+			return fmt.Errorf("RFC 9456 requires TLS 1.2 minimum")
+		}
+		if x.TLSConfig.MinVersion == 0 {
+			x.TLSConfig.MinVersion = tls.VersionTLS12
+		}
+		// Map tls to tcp for underlying network
+		tcpNetwork := "tcp4"
+		if x.Transport == "tls6" {
+			tcpNetwork = "tcp6"
+		}
+		// Dial underlying TCP connection
+		dialer := net.Dialer{Timeout: x.Timeout, Control: x.Control}
+		tcpConn, err := dialer.DialContext(x.Context, tcpNetwork, addr)
+		if err != nil {
+			return err
+		}
+		// Wrap with TLS
+		tlsConn := tls.Client(tcpConn, x.TLSConfig)
+		// Perform TLS handshake with context for timeout/cancellation
+		if err := tlsConn.HandshakeContext(x.Context); err != nil {
+			tcpConn.Close()
+			return fmt.Errorf("TLS handshake failed: %w", err)
+		}
+		x.Conn = tlsConn
+		return nil
 	}
 	dialer := net.Dialer{Timeout: x.Timeout, LocalAddr: localAddr, Control: x.Control}
 	x.Conn, err = dialer.DialContext(x.Context, x.Transport, addr)

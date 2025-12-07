@@ -5,6 +5,8 @@
 package gosnmp
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -12,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/pion/dtls/v3"
 )
 
 //
@@ -123,16 +127,40 @@ type TrapListener struct {
 	// Params is a reference to the TrapListener's "parent" GoSNMP instance.
 	Params *GoSNMP
 
-	// OnNewTrap handles incoming Trap and Inform PDUs.
+	// OnNewTrap is the legacy handler for incoming Trap and Inform PDUs.
+	// It receives *net.UDPAddr which works for UDP listeners.
+	//
+	// Deprecated: Use OnTrap instead for TLS/DTLS support.
+	// OnNewTrap continues to work for backward compatibility with existing code.
 	OnNewTrap TrapHandlerFunc
+
+	// OnTrap handles incoming Trap and Inform PDUs from any transport.
+	// It receives net.Addr which is *net.UDPAddr for UDP/DTLS or *net.TCPAddr for TCP/TLS.
+	// If both OnTrap and OnNewTrap are set, OnTrap takes precedence.
+	OnTrap HandlerFunc
 
 	// CloseTimeout is the max wait time for the socket to gracefully signal its closure.
 	CloseTimeout time.Duration
 
+	// TLSConfig specifies TLS configuration for TLS trap listeners.
+	// Required when listening on "tls://" addresses.
+	TLSConfig *tls.Config
+
+	// DTLSConfig specifies DTLS configuration for DTLS trap listeners.
+	// Required when listening on "dtls://" addresses.
+	DTLSConfig *dtls.Config
+
+	// CertMappings specifies how to map peer certificates to security names.
+	// Used with TSM (Transport Security Model) for TLS/DTLS listeners.
+	CertMappings []CertMapping
+
 	// These unexported fields are for letting test cases
 	// know we are ready.
-	conn  *net.UDPConn
-	proto string
+	conn         *net.UDPConn  // UDP listener (keep for backward compat)
+	tcpListener  net.Listener  // TCP listener
+	tlsListener  net.Listener  // TLS listener
+	dtlsListener net.Listener  // DTLS listener
+	proto        string
 
 	// Total number of packets received referencing an unknown snmpEngineID
 	usmStatsUnknownEngineIDsCount uint32
@@ -145,19 +173,24 @@ type TrapListener struct {
 // Default timeout value for CloseTimeout of 3 seconds
 const defaultCloseTimeout = 3 * time.Second
 
-// TrapHandlerFunc is a callback function type which receives SNMP Trap and
-// Inform packets when they are received.  If this callback is null, Trap and
-// Inform PDUs will not be received (Inform responses will still be sent,
-// however).  This callback should not modify the contents of the SnmpPacket
-// nor the UDPAddr passed to it, and it should copy out any values it wishes to
-// use instead of retaining references in order to avoid memory fragmentation.
+// TrapHandlerFunc is the legacy callback type for SNMP Trap and Inform packets.
+// It receives traps with a *net.UDPAddr, which works for UDP listeners.
 //
-// The general effect of received Trap and Inform packets do not differ for the
-// receiver, and the response is handled by the caller of the handler, so there
-// is no need for the application to handle Informs any different than Traps.
-// Nonetheless, the packet's Type field can be examined to determine what type
-// of event this is for e.g. statistics gathering functions, etc.
-type TrapHandlerFunc func(s *SnmpPacket, u *net.UDPAddr)
+// Deprecated: Use HandlerFunc and the OnTrap field instead for TLS/DTLS support.
+// OnNewTrap with TrapHandlerFunc continues to work for backward compatibility.
+type TrapHandlerFunc func(s *SnmpPacket, addr *net.UDPAddr)
+
+// HandlerFunc is the callback type for SNMP Trap and Inform packets that
+// supports all transport types (UDP, TCP, TLS, DTLS).
+//
+// The addr parameter type depends on the transport:
+//   - UDP/DTLS: *net.UDPAddr
+//   - TCP/TLS: *net.TCPAddr
+//
+// This callback should not modify the contents of the SnmpPacket nor the
+// address passed to it, and it should copy out any values it wishes to use
+// instead of retaining references in order to avoid memory fragmentation.
+type HandlerFunc func(s *SnmpPacket, addr net.Addr)
 
 // NewTrapListener returns an initialized TrapListener.
 //
@@ -202,12 +235,23 @@ func (t *TrapListener) Close() {
 		t.Lock()
 		defer t.Unlock()
 
-		if t.conn == nil {
-			return
+		// Close whichever listener is active
+		var closeErr error
+		switch {
+		case t.conn != nil:
+			closeErr = t.conn.Close()
+		case t.tcpListener != nil:
+			closeErr = t.tcpListener.Close()
+		case t.tlsListener != nil:
+			closeErr = t.tlsListener.Close()
+		case t.dtlsListener != nil:
+			closeErr = t.dtlsListener.Close()
+		default:
+			return // No listener to close
 		}
 
-		if err := t.conn.Close(); err != nil {
-			t.Params.Logger.Printf("failed to Close() the TrapListener socket: %s", err)
+		if closeErr != nil {
+			t.Params.Logger.Printf("failed to Close() the TrapListener socket: %s", closeErr)
 		}
 
 		select {
@@ -306,12 +350,12 @@ func (t *TrapListener) listenUDP(addr string) error {
 					// RFC3414 3.2.3a: Continue processing
 				}
 			}
-			// Here we assume that t.OnNewTrap will not alter the contents
+			// Here we assume that the trap handler will not alter the contents
 			// of the PDU (per documentation, because Go does not have
 			// compile-time const checking).  We don't pass a copy because
 			// the SnmpPacket type is somewhat large, but we could without
 			// violating any implicit or explicit spec.
-			t.OnNewTrap(trap, remote)
+			t.dispatchTrap(trap, remote)
 
 			// If it was an Inform request, we need to send a response.
 			if trap.PDUType == InformRequest { //nolint:whitespace
@@ -375,12 +419,10 @@ func (t *TrapListener) handleTCPRequest(conn net.Conn) {
 	msg := buf[:reqLen]
 	traps, err := t.Params.UnmarshalTrap(msg, false)
 	if err != nil {
-		t.Params.Logger.Printf("TrapListener: error in read %s\n", err)
+		t.Params.Logger.Printf("TrapListener: error in unmarshal %s\n", err)
 		return
 	}
-	// TODO: lying for backward compatibility reason - create UDP Address ... not nice
-	r, _ := net.ResolveUDPAddr("", conn.RemoteAddr().String())
-	t.OnNewTrap(traps, r)
+	t.dispatchTrap(traps, conn.RemoteAddr())
 	// Close the connection when you're done with it.
 	conn.Close()
 }
@@ -410,10 +452,13 @@ func (t *TrapListener) listenTCP(addr string) error {
 
 			// Listen for an incoming connection.
 			conn, err := l.Accept()
-			fmt.Printf("ACCEPT: %s", conn)
 			if err != nil {
-				fmt.Println("error accepting: ", err.Error())
-				return err
+				if atomic.LoadInt32(&t.finish) == 1 {
+					t.done <- true
+					return nil
+				}
+				t.Params.Logger.Printf("TrapListener: error accepting TCP connection: %s\n", err)
+				continue
 			}
 			// Handle connections in a new goroutine.
 			go t.handleTCPRequest(conn)
@@ -436,8 +481,9 @@ func (t *TrapListener) Listen(addr string) error {
 	// TestSendV1Trap
 	_ = t.Params.validateParameters()
 
-	if t.OnNewTrap == nil {
-		t.OnNewTrap = t.debugTrapHandler
+	// Set default handler if neither is set
+	if t.OnTrap == nil && t.OnNewTrap == nil {
+		t.OnTrap = t.debugTrapHandler
 	}
 
 	splitted := strings.SplitN(addr, "://", 2)
@@ -452,14 +498,49 @@ func (t *TrapListener) Listen(addr string) error {
 		return t.listenTCP(addr)
 	case udp:
 		return t.listenUDP(addr)
+	case "tls":
+		return t.listenTLS(addr)
+	case "dtls":
+		return t.listenDTLS(addr)
 	default:
-		return fmt.Errorf("not implemented network protocol: %s [use: tcp/udp]", t.proto)
+		return fmt.Errorf("not implemented network protocol: %s [use: tcp/udp/tls/dtls]", t.proto)
 	}
 }
 
-// Default trap handler
-func (t *TrapListener) debugTrapHandler(s *SnmpPacket, u *net.UDPAddr) {
-	t.Params.Logger.Printf("got trapdata from %+v: %+v\n", u, s)
+// debugTrapHandler is the default handler that logs received traps.
+func (t *TrapListener) debugTrapHandler(s *SnmpPacket, addr net.Addr) {
+	t.Params.Logger.Printf("got trapdata from %+v: %+v\n", addr, s)
+}
+
+// dispatchTrap sends the trap to the appropriate handler.
+// It prefers OnTrap (new API) over OnNewTrap (legacy API).
+// For TCP/TLS transports with only OnNewTrap set, it synthesizes a *net.UDPAddr.
+func (t *TrapListener) dispatchTrap(p *SnmpPacket, addr net.Addr) {
+	// Prefer new generic handler
+	if t.OnTrap != nil {
+		t.OnTrap(p, addr)
+		return
+	}
+
+	// Fallback to legacy handler
+	if t.OnNewTrap != nil {
+		// Fast path for UDP/DTLS - direct pass-through
+		if udpAddr, ok := addr.(*net.UDPAddr); ok {
+			t.OnNewTrap(p, udpAddr)
+			return
+		}
+
+		// Synthesize UDPAddr for TCP/TLS (best-effort backward compat)
+		if tcpAddr, ok := addr.(*net.TCPAddr); ok {
+			t.Params.Logger.Printf("TrapListener: synthesizing UDPAddr from TCPAddr for legacy OnNewTrap handler\n")
+			t.OnNewTrap(p, &net.UDPAddr{IP: tcpAddr.IP, Port: tcpAddr.Port, Zone: tcpAddr.Zone})
+			return
+		}
+
+		// Unknown address type - synthesize empty UDPAddr
+		t.Params.Logger.Printf("TrapListener: unknown address type %T, using empty UDPAddr\n", addr)
+		t.OnNewTrap(p, &net.UDPAddr{})
+	}
 }
 
 // UnmarshalTrap unpacks the SNMP Trap.
@@ -547,4 +628,242 @@ func (x *GoSNMP) unmarshalTrapBase(trap []byte, sp SnmpV3SecurityParameters, use
 		return nil, err
 	}
 	return result, nil
+}
+
+// listenTLS listens for SNMP traps over TLS.
+func (t *TrapListener) listenTLS(addr string) error {
+	if t.TLSConfig == nil {
+		return errors.New("TLSConfig required for TLS trap listener")
+	}
+
+	// Require client certs for TSM
+	t.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
+
+	// Enforce RFC 9456 minimum
+	if t.TLSConfig.MinVersion != 0 && t.TLSConfig.MinVersion < tls.VersionTLS12 {
+		return errors.New("RFC 9456 requires TLS 1.2 minimum")
+	}
+	if t.TLSConfig.MinVersion == 0 {
+		t.TLSConfig.MinVersion = tls.VersionTLS12
+	}
+
+	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		return err
+	}
+
+	tcpListener, err := net.ListenTCP("tcp", tcpAddr)
+	if err != nil {
+		return err
+	}
+
+	t.tlsListener = tls.NewListener(tcpListener, t.TLSConfig)
+	t.listening <- true
+
+	for {
+		if atomic.LoadInt32(&t.finish) == 1 {
+			t.done <- true
+			return nil
+		}
+
+		conn, err := t.tlsListener.Accept()
+		if err != nil {
+			if atomic.LoadInt32(&t.finish) == 1 {
+				t.done <- true
+				return nil
+			}
+			continue
+		}
+		go t.handleTLSConnection(conn.(*tls.Conn))
+	}
+}
+
+// handleTLSConnection handles a single TLS connection with trap data.
+func (t *TrapListener) handleTLSConnection(conn *tls.Conn) {
+	defer conn.Close()
+
+	// Perform TLS handshake explicitly to access peer certs
+	if err := conn.Handshake(); err != nil {
+		t.Params.Logger.Printf("TLS handshake failed: %s\n", err)
+		return
+	}
+
+	buf := make([]byte, t.buffSize)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Params.Logger.Printf("TLS read error: %s\n", err)
+		return
+	}
+
+	trap, err := t.Params.UnmarshalTrap(buf[:n], false)
+	if err != nil {
+		t.Params.Logger.Printf("TLS unmarshal error: %s\n", err)
+		return
+	}
+
+	// Inject TSM identity from TLS peer cert
+	if trap.SecurityModel == TransportSecurityModel {
+		t.injectTsmIdentityFromTLS(conn, trap)
+	}
+
+	t.dispatchTrap(trap, conn.RemoteAddr())
+
+	// Handle Inform response
+	if trap.PDUType == InformRequest {
+		t.sendTLSInformResponse(conn, trap)
+	}
+}
+
+// injectTsmIdentityFromTLS extracts security name from TLS peer certificate.
+func (t *TrapListener) injectTsmIdentityFromTLS(conn *tls.Conn, trap *SnmpPacket) {
+	tsmParams, ok := trap.SecurityParameters.(*TsmSecurityParameters)
+	if !ok {
+		return
+	}
+
+	state := conn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		return
+	}
+
+	if len(t.CertMappings) > 0 {
+		secName, err := ExtractSecurityName(state.PeerCertificates[0], t.CertMappings)
+		if err != nil {
+			t.Params.Logger.Printf("TLS: failed to extract securityName: %v\n", err)
+			return
+		}
+		tsmParams.SecurityName = secName
+	}
+}
+
+// sendTLSInformResponse sends a response to an Inform request over TLS.
+func (t *TrapListener) sendTLSInformResponse(conn *tls.Conn, trap *SnmpPacket) {
+	trap.PDUType = GetResponse
+	trap.Error = NoError
+	trap.ErrorIndex = 0
+
+	respBytes, err := trap.marshalMsg()
+	if err != nil {
+		t.Params.Logger.Printf("TLS: failed to marshal Inform response: %s\n", err)
+		return
+	}
+
+	if _, err := conn.Write(respBytes); err != nil {
+		t.Params.Logger.Printf("TLS: failed to send Inform response: %s\n", err)
+	}
+}
+
+// listenDTLS listens for SNMP traps over DTLS.
+func (t *TrapListener) listenDTLS(addr string) error {
+	if t.DTLSConfig == nil {
+		return errors.New("DTLSConfig required for DTLS trap listener")
+	}
+
+	// Require client certs for TSM
+	t.DTLSConfig.ClientAuth = dtls.RequireAndVerifyClientCert
+
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return err
+	}
+
+	listener, err := dtls.Listen("udp", udpAddr, t.DTLSConfig)
+	if err != nil {
+		return err
+	}
+	t.dtlsListener = listener
+	t.listening <- true
+
+	for {
+		if atomic.LoadInt32(&t.finish) == 1 {
+			t.done <- true
+			return nil
+		}
+
+		conn, err := listener.Accept()
+		if err != nil {
+			if atomic.LoadInt32(&t.finish) == 1 {
+				t.done <- true
+				return nil
+			}
+			continue
+		}
+		go t.handleDTLSConnection(conn.(*dtls.Conn))
+	}
+}
+
+// handleDTLSConnection handles a single DTLS connection with trap data.
+func (t *TrapListener) handleDTLSConnection(conn *dtls.Conn) {
+	defer conn.Close()
+
+	buf := make([]byte, t.buffSize)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Params.Logger.Printf("DTLS read error: %s\n", err)
+		return
+	}
+
+	trap, err := t.Params.UnmarshalTrap(buf[:n], false)
+	if err != nil {
+		t.Params.Logger.Printf("DTLS unmarshal error: %s\n", err)
+		return
+	}
+
+	// Inject TSM identity from DTLS peer cert
+	if trap.SecurityModel == TransportSecurityModel {
+		t.injectTsmIdentityFromDTLS(conn, trap)
+	}
+
+	t.dispatchTrap(trap, conn.RemoteAddr())
+
+	// Handle Inform response
+	if trap.PDUType == InformRequest {
+		t.sendDTLSInformResponse(conn, trap)
+	}
+}
+
+// injectTsmIdentityFromDTLS extracts security name from DTLS peer certificate.
+func (t *TrapListener) injectTsmIdentityFromDTLS(conn *dtls.Conn, trap *SnmpPacket) {
+	tsmParams, ok := trap.SecurityParameters.(*TsmSecurityParameters)
+	if !ok {
+		return
+	}
+
+	state, ok := conn.ConnectionState()
+	if !ok || len(state.PeerCertificates) == 0 {
+		return
+	}
+
+	// pion/dtls returns raw DER, must parse
+	cert, err := x509.ParseCertificate(state.PeerCertificates[0])
+	if err != nil {
+		t.Params.Logger.Printf("DTLS: failed to parse peer cert: %v\n", err)
+		return
+	}
+
+	if len(t.CertMappings) > 0 {
+		secName, err := ExtractSecurityName(cert, t.CertMappings)
+		if err != nil {
+			t.Params.Logger.Printf("DTLS: failed to extract securityName: %v\n", err)
+			return
+		}
+		tsmParams.SecurityName = secName
+	}
+}
+
+// sendDTLSInformResponse sends a response to an Inform request over DTLS.
+func (t *TrapListener) sendDTLSInformResponse(conn *dtls.Conn, trap *SnmpPacket) {
+	trap.PDUType = GetResponse
+	trap.Error = NoError
+	trap.ErrorIndex = 0
+
+	respBytes, err := trap.marshalMsg()
+	if err != nil {
+		t.Params.Logger.Printf("DTLS: failed to marshal Inform response: %s\n", err)
+		return
+	}
+
+	if _, err := conn.Write(respBytes); err != nil {
+		t.Params.Logger.Printf("DTLS: failed to send Inform response: %s\n", err)
+	}
 }

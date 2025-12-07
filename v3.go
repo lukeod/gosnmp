@@ -32,9 +32,10 @@ const (
 // SnmpV3SecurityModel describes the security model used by a SnmpV3 connection
 type SnmpV3SecurityModel uint8
 
-// UserSecurityModel is the only SnmpV3SecurityModel currently implemented.
+// SnmpV3SecurityModel constants
 const (
-	UserSecurityModel SnmpV3SecurityModel = 3
+	UserSecurityModel      SnmpV3SecurityModel = 3
+	TransportSecurityModel SnmpV3SecurityModel = 4
 )
 
 //go:generate stringer -type=SnmpV3SecurityModel
@@ -64,12 +65,20 @@ type SnmpV3SecurityParameters interface {
 }
 
 func (x *GoSNMP) validateParametersV3() error {
-	// update following code if you implement a new security model
-	if x.SecurityModel != UserSecurityModel {
-		return errors.New("the SNMPV3 User Security Model is the only SNMPV3 security model currently implemented")
-	}
 	if x.SecurityParameters == nil {
 		return errors.New("SNMPV3 SecurityParameters must be set")
+	}
+
+	switch x.SecurityModel {
+	case UserSecurityModel:
+		// USM validation handled by SecurityParameters.validate()
+	case TransportSecurityModel:
+		// TSM requires TLS or DTLS transport configuration
+		if x.TLSConfig == nil && x.DTLSConfig == nil {
+			return errors.New("TSM requires TLSConfig or DTLSConfig to be set")
+		}
+	default:
+		return errors.New("unsupported SNMPV3 security model")
 	}
 
 	return x.SecurityParameters.validate(x.MsgFlags)
@@ -101,6 +110,12 @@ func (x *GoSNMP) testAuthentication(packet []byte, result *SnmpPacket, useRespon
 	if x.Version != Version3 {
 		return fmt.Errorf("testAuthentication called with non Version3 connection")
 	}
+
+	// TSM: transport layer already authenticated the connection
+	if result.SecurityModel == TransportSecurityModel {
+		return nil
+	}
+
 	msgFlags := x.MsgFlags
 	if useResponseSecurityParameters {
 		msgFlags = result.MsgFlags
@@ -109,7 +124,10 @@ func (x *GoSNMP) testAuthentication(packet []byte, result *SnmpPacket, useRespon
 	// Special case for Engine Discovery (RFC3414 section 4) where we should
 	// skip authentication for the discovery packet with the special settings
 	// described in the RFC. The discovery package requires
-	msgSecParams := result.SecurityParameters.(*UsmSecurityParameters)
+	msgSecParams, ok := result.SecurityParameters.(*UsmSecurityParameters)
+	if !ok {
+		return fmt.Errorf("testAuthentication: unexpected security parameters type for security model %d", result.SecurityModel)
+	}
 	if msgFlags&NoAuthNoPriv == 0 && // NoAuthNoPriv method
 		msgSecParams.UserName == "" && // empty username
 		msgSecParams.AuthoritativeEngineID == "" && // empty authoritative engine ID
@@ -240,8 +258,13 @@ func (packet *SnmpPacket) marshalV3(buf *bytes.Buffer) (*bytes.Buffer, error) {
 	if err != nil {
 		return emptyBuffer, err
 	}
-	packet.Logger.Printf("Marshal V3 SecurityParameters len=%d. Eaten Last 4 Bytes=%v",
-		len(securityParameters), securityParameters[len(securityParameters)-4:])
+	if len(securityParameters) >= 4 {
+		packet.Logger.Printf("Marshal V3 SecurityParameters len=%d. Eaten Last 4 Bytes=%v",
+			len(securityParameters), securityParameters[len(securityParameters)-4:])
+	} else {
+		packet.Logger.Printf("Marshal V3 SecurityParameters len=%d. Bytes=%v",
+			len(securityParameters), securityParameters)
+	}
 
 	buf.Write([]byte{byte(OctetString)})
 	secParamLen, err := marshalLength(len(securityParameters))
@@ -436,7 +459,12 @@ func (x *GoSNMP) unmarshalV3Header(packet []byte,
 		return 0, errors.New("error parsing SNMPV3 message ID: truncted packet")
 	}
 	if response.SecurityParameters == nil {
-		response.SecurityParameters = &UsmSecurityParameters{Logger: x.Logger}
+		switch response.SecurityModel {
+		case TransportSecurityModel:
+			response.SecurityParameters = &TsmSecurityParameters{Logger: x.Logger}
+		default:
+			response.SecurityParameters = &UsmSecurityParameters{Logger: x.Logger}
+		}
 	}
 
 	cursor, err = response.SecurityParameters.unmarshal(response.MsgFlags, packet, cursor)
