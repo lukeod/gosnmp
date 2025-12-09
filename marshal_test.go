@@ -2089,3 +2089,534 @@ func dumpBytes2(desc string, bb []byte, cursor int) string {
 	}
 	return result
 }
+
+// TestUnmarshalVBL tests parsing of VarBindList (VBL) with various BER length
+// encoding forms. Per X.690 §8.1.3.4, short-form uses single byte for lengths
+// 0-127. Per X.690 §8.1.3.5, long-form uses multiple bytes for any length.
+// Per RFC 3417 §8(1), senders may use long-form even when short-form suffices.
+func TestUnmarshalVBL(t *testing.T) {
+	// Simple varbind: OID .1.3.6.1.2.1.1.1.0 with NULL value
+	// OID: 0x06 0x08 0x2b 0x06 0x01 0x02 0x01 0x01 0x01 0x00 (10 bytes)
+	// NULL: 0x05 0x00 (2 bytes)
+	// Varbind content: 12 bytes
+	// Varbind with SEQUENCE header: 0x30 0x0c + 12 bytes = 14 bytes total
+	varbind := []byte{
+		0x30, 0x0c, // SEQUENCE, length 12
+		0x06, 0x08, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00, // OID
+		0x05, 0x00, // NULL value
+	}
+
+	tests := []struct {
+		name         string
+		data         []byte
+		expectError  bool
+		expectVBLen  int    // expected number of varbinds
+		expectOID    string // expected OID of first varbind (if any)
+	}{
+		// Empty VBL with short-form BER length encoding
+		{
+			name: "empty_VBL_short_form",
+			// 0x30 = SEQUENCE, 0x00 = length 0 (short-form)
+			data:        []byte{0x30, 0x00},
+			expectError: false,
+			expectVBLen: 0,
+		},
+
+		// Empty VBL with long-form 1-octet BER length encoding
+		// Per X.690 §8.1.3.5 Note 2: sender may use more length octets than minimum
+		{
+			name: "empty_VBL_long_form_one_octet",
+			// 0x30 = SEQUENCE, 0x81 = long-form (1 length byte follows),
+			// 0x00 = length 0
+			data:        []byte{0x30, 0x81, 0x00},
+			expectError: false,
+			expectVBLen: 0,
+		},
+
+		// Empty VBL with long-form 2-octet BER length encoding
+		{
+			name: "empty_VBL_long_form_two_octets",
+			// 0x30 = SEQUENCE, 0x82 = long-form (2 length bytes follow),
+			// 0x00 0x00 = length 0
+			data:        []byte{0x30, 0x82, 0x00, 0x00},
+			expectError: false,
+			expectVBLen: 0,
+		},
+
+		// Non-empty VBL with short-form BER length encoding
+		{
+			name: "single_varbind_short_form",
+			// 0x30 = SEQUENCE, 0x0e = length 14 (short-form), followed by varbind
+			data:        append([]byte{0x30, 0x0e}, varbind...),
+			expectError: false,
+			expectVBLen: 1,
+			expectOID:   ".1.3.6.1.2.1.1.1.0",
+		},
+
+		// Non-empty VBL with long-form 1-octet BER length encoding
+		{
+			name: "single_varbind_long_form_one_octet",
+			// 0x30 = SEQUENCE, 0x81 = long-form (1 length byte follows),
+			// 0x0e = length 14, followed by varbind
+			data:        append([]byte{0x30, 0x81, 0x0e}, varbind...),
+			expectError: false,
+			expectVBLen: 1,
+			expectOID:   ".1.3.6.1.2.1.1.1.0",
+		},
+
+		// Non-empty VBL with long-form 2-octet BER length encoding
+		{
+			name: "single_varbind_long_form_two_octets",
+			// 0x30 = SEQUENCE, 0x82 = long-form (2 length bytes follow),
+			// 0x00 0x0e = length 14, followed by varbind
+			data:        append([]byte{0x30, 0x82, 0x00, 0x0e}, varbind...),
+			expectError: false,
+			expectVBLen: 1,
+			expectOID:   ".1.3.6.1.2.1.1.1.0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := &GoSNMP{}
+			g.Logger = NewLogger(log.New(io.Discard, "", 0))
+			response := &SnmpPacket{}
+
+			err := g.unmarshalVBL(tt.data, response)
+
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("unmarshalVBL() expected error, got nil")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("unmarshalVBL() unexpected error: %v", err)
+				return
+			}
+
+			if len(response.Variables) != tt.expectVBLen {
+				t.Errorf("unmarshalVBL() Variables count = %d, want %d",
+					len(response.Variables), tt.expectVBLen)
+				return
+			}
+
+			if tt.expectVBLen > 0 && tt.expectOID != "" {
+				if response.Variables[0].Name != tt.expectOID {
+					t.Errorf("unmarshalVBL() OID = %q, want %q",
+						response.Variables[0].Name, tt.expectOID)
+				}
+			}
+		})
+	}
+}
+
+// TestMarshalVarbindLargeOID tests marshaling of varbinds containing OIDs that
+// encode to more than 127 bytes. Per X.690 §8.1.3.4, short-form is limited to
+// lengths 0-127. Per X.690 §8.1.3.5, long-form is required for lengths > 127
+// (0x81 0xNN for 128-255 bytes, 0x82 0xNN 0xNN for larger).
+//
+// This tests that the marshaled output can be successfully unmarshaled back,
+// validating that OID lengths use proper long-form BER encoding rather than
+// single-byte truncation.
+func TestMarshalVarbindLargeOID(t *testing.T) {
+	// Create an OID with many large sub-identifiers.
+	// Each sub-identifier > 127 uses multi-byte base-128 encoding.
+	// Sub-identifier 4294967295 (0xFFFFFFFF) encodes as 5 bytes in base-128.
+	// We need at least 26 such sub-identifiers to exceed 127 bytes encoded.
+	var oidParts []string
+	oidParts = append(oidParts, ".1.3.6.1.4.1") // standard enterprise prefix (6 bytes)
+
+	// Add 30 large sub-identifiers (each ~5 bytes encoded = 150 bytes)
+	for i := 0; i < 30; i++ {
+		oidParts = append(oidParts, "4294967295")
+	}
+	largeOID := strings.Join(oidParts, ".")
+
+	tests := []struct {
+		name    string
+		pdu     SnmpPDU
+		wantErr bool
+	}{
+		{
+			name: "large_OID_with_null_value",
+			pdu: SnmpPDU{
+				Name:  largeOID,
+				Type:  Null,
+				Value: nil,
+			},
+			wantErr: false,
+		},
+		{
+			name: "large_OID_with_integer_value",
+			pdu: SnmpPDU{
+				Name:  largeOID,
+				Type:  Integer,
+				Value: 42,
+			},
+			wantErr: false,
+		},
+		{
+			name: "large_OID_with_octetstring_value",
+			pdu: SnmpPDU{
+				Name:  largeOID,
+				Type:  OctetString,
+				Value: []byte("test"),
+			},
+			wantErr: false,
+		},
+		{
+			name: "large_OID_with_counter32_value",
+			pdu: SnmpPDU{
+				Name:  largeOID,
+				Type:  Counter32,
+				Value: uint32(1000000),
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Marshal the varbind
+			data, err := marshalVarbind(&tt.pdu)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("marshalVarbind() expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("marshalVarbind() unexpected error: %v", err)
+				return
+			}
+
+			// Verify the marshaled data can be unmarshaled back
+			// This validates that the length encoding is correct
+			g := &GoSNMP{}
+			g.Logger = NewLogger(log.New(io.Discard, "", 0))
+
+			// The marshaled varbind is wrapped in a SEQUENCE, so we can parse
+			// it as a VBL containing one varbind
+			response := &SnmpPacket{}
+			err = g.unmarshalVBL(data, response)
+			if err != nil {
+				t.Errorf("unmarshalVBL() failed to parse marshaled data: %v", err)
+				return
+			}
+
+			if len(response.Variables) != 1 {
+				t.Errorf("unmarshalVBL() expected 1 variable, got %d", len(response.Variables))
+				return
+			}
+
+			// Verify the OID matches
+			if response.Variables[0].Name != tt.pdu.Name {
+				t.Errorf("OID mismatch: got %q, want %q",
+					response.Variables[0].Name, tt.pdu.Name)
+			}
+		})
+	}
+}
+
+// TestMarshalVarbindLargeOIDCounter64 tests marshaling of Counter64 varbinds
+// containing OIDs that encode to more than 127 bytes. Per X.690 §8.1.3.5,
+// lengths > 127 require long-form BER encoding.
+func TestMarshalVarbindLargeOIDCounter64(t *testing.T) {
+	// Create an OID with many large sub-identifiers to exceed 127 bytes encoded.
+	var oidParts []string
+	oidParts = append(oidParts, ".1.3.6.1.4.1")
+	for i := 0; i < 30; i++ {
+		oidParts = append(oidParts, "4294967295")
+	}
+	largeOID := strings.Join(oidParts, ".")
+
+	pdu := SnmpPDU{
+		Name:  largeOID,
+		Type:  Counter64,
+		Value: uint64(18446744073709551615), // max uint64
+	}
+
+	data, err := marshalVarbind(&pdu)
+	if err != nil {
+		t.Errorf("marshalVarbind() unexpected error: %v", err)
+		return
+	}
+
+	// Verify round-trip: unmarshal should succeed if length encoding is correct
+	g := &GoSNMP{}
+	g.Logger = NewLogger(log.New(io.Discard, "", 0))
+	response := &SnmpPacket{}
+	err = g.unmarshalVBL(data, response)
+	if err != nil {
+		t.Errorf("unmarshalVBL() failed to parse marshaled Counter64 data: %v", err)
+		return
+	}
+
+	if len(response.Variables) != 1 {
+		t.Errorf("unmarshalVBL() expected 1 variable, got %d", len(response.Variables))
+		return
+	}
+
+	if response.Variables[0].Name != pdu.Name {
+		t.Errorf("OID mismatch: got %q, want %q", response.Variables[0].Name, pdu.Name)
+	}
+}
+
+// TestMarshalVarbindLargeOIDNoSuchTypes tests marshaling of NoSuchInstance,
+// NoSuchObject, and EndOfMibView varbinds containing OIDs that encode to more
+// than 127 bytes. Per X.690 §8.1.3.5, lengths > 127 require long-form BER.
+func TestMarshalVarbindLargeOIDNoSuchTypes(t *testing.T) {
+	// Create an OID with many large sub-identifiers to exceed 127 bytes encoded.
+	var oidParts []string
+	oidParts = append(oidParts, ".1.3.6.1.4.1")
+	for i := 0; i < 30; i++ {
+		oidParts = append(oidParts, "4294967295")
+	}
+	largeOID := strings.Join(oidParts, ".")
+
+	tests := []struct {
+		name    string
+		pduType Asn1BER
+	}{
+		{"NoSuchInstance", NoSuchInstance},
+		{"NoSuchObject", NoSuchObject},
+		{"EndOfMibView", EndOfMibView},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pdu := SnmpPDU{
+				Name:  largeOID,
+				Type:  tt.pduType,
+				Value: nil,
+			}
+
+			data, err := marshalVarbind(&pdu)
+			if err != nil {
+				t.Errorf("marshalVarbind() unexpected error: %v", err)
+				return
+			}
+
+			// Verify round-trip
+			g := &GoSNMP{}
+			g.Logger = NewLogger(log.New(io.Discard, "", 0))
+			response := &SnmpPacket{}
+			err = g.unmarshalVBL(data, response)
+			if err != nil {
+				t.Errorf("unmarshalVBL() failed to parse marshaled %s data: %v", tt.name, err)
+				return
+			}
+
+			if len(response.Variables) != 1 {
+				t.Errorf("unmarshalVBL() expected 1 variable, got %d", len(response.Variables))
+				return
+			}
+
+			if response.Variables[0].Name != pdu.Name {
+				t.Errorf("OID mismatch: got %q, want %q", response.Variables[0].Name, pdu.Name)
+			}
+		})
+	}
+}
+
+// TestMarshalPDUFieldLengths tests that PDU fields (NonRepeaters, MaxRepetitions,
+// ErrorStatus, ErrorIndex) are correctly marshaled. Per RFC 3416, max-bindings
+// is defined as 2147483647. These integer fields should always fit in short-form
+// BER length encoding (X.690 §8.1.3.4), but we verify the marshaling produces
+// valid BER that can be unmarshaled.
+func TestMarshalPDUFieldLengths(t *testing.T) {
+	tests := []struct {
+		name           string
+		pduType        PDUType
+		nonRepeaters   uint8
+		maxRepetitions uint32
+		errorStatus    SNMPError
+		errorIndex     uint8
+	}{
+		{
+			name:           "GetBulkRequest_small_values",
+			pduType:        GetBulkRequest,
+			nonRepeaters:   0,
+			maxRepetitions: 10,
+		},
+		{
+			name:           "GetBulkRequest_max_values",
+			pduType:        GetBulkRequest,
+			nonRepeaters:   255,        // max uint8
+			maxRepetitions: 2147483647, // Per RFC 3416, max-bindings = 2147483647
+		},
+		{
+			name:        "GetResponse_small_values",
+			pduType:     GetResponse,
+			errorStatus: NoError,
+			errorIndex:  0,
+		},
+		{
+			name:        "GetResponse_max_error_values",
+			pduType:     GetResponse,
+			errorStatus: SNMPError(255),
+			errorIndex:  255,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			packet := &SnmpPacket{
+				Version:        Version2c,
+				Community:      "public",
+				PDUType:        tt.pduType,
+				RequestID:      12345,
+				NonRepeaters:   tt.nonRepeaters,
+				MaxRepetitions: tt.maxRepetitions,
+				Error:          tt.errorStatus,
+				ErrorIndex:     tt.errorIndex,
+				Variables: []SnmpPDU{
+					{Name: ".1.3.6.1.2.1.1.1.0", Type: Null, Value: nil},
+				},
+			}
+
+			// Marshal the full packet
+			data, err := packet.marshalMsg()
+			if err != nil {
+				t.Errorf("marshalMsg() unexpected error: %v", err)
+				return
+			}
+
+			// Verify by unmarshaling
+			g := &GoSNMP{Version: Version2c}
+			g.Logger = NewLogger(log.New(io.Discard, "", 0))
+			response, err := g.SnmpDecodePacket(data)
+			if err != nil {
+				t.Errorf("SnmpDecodePacket() failed to parse marshaled data: %v", err)
+				return
+			}
+
+			if tt.pduType == GetBulkRequest {
+				if response.NonRepeaters != tt.nonRepeaters {
+					t.Errorf("NonRepeaters mismatch: got %d, want %d",
+						response.NonRepeaters, tt.nonRepeaters)
+				}
+				if response.MaxRepetitions != tt.maxRepetitions {
+					t.Errorf("MaxRepetitions mismatch: got %d, want %d",
+						response.MaxRepetitions, tt.maxRepetitions)
+				}
+			} else {
+				if response.Error != tt.errorStatus {
+					t.Errorf("ErrorStatus mismatch: got %d, want %d",
+						response.Error, tt.errorStatus)
+				}
+				if response.ErrorIndex != tt.errorIndex {
+					t.Errorf("ErrorIndex mismatch: got %d, want %d",
+						response.ErrorIndex, tt.errorIndex)
+				}
+			}
+		})
+	}
+}
+
+// TestMarshalSNMPv1TrapHeader tests marshaling of SNMPv1 Trap packets with
+// various field values. The trap header contains Enterprise OID, AgentAddress,
+// GenericTrap, SpecificTrap, and Timestamp fields that must be correctly
+// BER-encoded.
+func TestMarshalSNMPv1TrapHeader(t *testing.T) {
+	// Create a large OID to test OID length encoding
+	var largeParts []string
+	largeParts = append(largeParts, ".1.3.6.1.4.1")
+	for i := 0; i < 30; i++ {
+		largeParts = append(largeParts, "4294967295")
+	}
+	largeOID := strings.Join(largeParts, ".")
+
+	tests := []struct {
+		name         string
+		enterprise   string
+		agentAddr    string
+		genericTrap  int
+		specificTrap int
+		timestamp    uint
+	}{
+		{
+			name:         "standard_trap",
+			enterprise:   ".1.3.6.1.4.1.9.9.999",
+			agentAddr:    "192.168.1.1",
+			genericTrap:  6, // enterpriseSpecific
+			specificTrap: 1,
+			timestamp:    1000,
+		},
+		{
+			name:         "max_trap_values",
+			enterprise:   ".1.3.6.1.4.1.9.9.999",
+			agentAddr:    "255.255.255.255",
+			genericTrap:  2147483647, // max int32
+			specificTrap: 2147483647,
+			timestamp:    4294967295, // max uint32
+		},
+		{
+			name:         "large_enterprise_OID",
+			enterprise:   largeOID,
+			agentAddr:    "10.0.0.1",
+			genericTrap:  6,
+			specificTrap: 100,
+			timestamp:    12345,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			packet := &SnmpPacket{
+				Version:   Version1,
+				Community: "public",
+				PDUType:   Trap,
+				SnmpTrap: SnmpTrap{
+					Enterprise:   tt.enterprise,
+					AgentAddress: tt.agentAddr,
+					GenericTrap:  tt.genericTrap,
+					SpecificTrap: tt.specificTrap,
+					Timestamp:    tt.timestamp,
+					Variables: []SnmpPDU{
+						{Name: ".1.3.6.1.2.1.1.3.0", Type: TimeTicks, Value: uint32(1000)},
+					},
+				},
+			}
+
+			// Marshal the trap
+			data, err := packet.marshalMsg()
+			if err != nil {
+				t.Errorf("marshalMsg() unexpected error: %v", err)
+				return
+			}
+
+			// Verify by unmarshaling
+			g := &GoSNMP{Version: Version1}
+			g.Logger = NewLogger(log.New(io.Discard, "", 0))
+			response, err := g.SnmpDecodePacket(data)
+			if err != nil {
+				t.Errorf("SnmpDecodePacket() failed to parse marshaled trap: %v", err)
+				return
+			}
+
+			if response.Enterprise != tt.enterprise {
+				t.Errorf("Enterprise mismatch: got %q, want %q",
+					response.Enterprise, tt.enterprise)
+			}
+			if response.AgentAddress != tt.agentAddr {
+				t.Errorf("AgentAddress mismatch: got %q, want %q",
+					response.AgentAddress, tt.agentAddr)
+			}
+			if response.GenericTrap != tt.genericTrap {
+				t.Errorf("GenericTrap mismatch: got %d, want %d",
+					response.GenericTrap, tt.genericTrap)
+			}
+			if response.SpecificTrap != tt.specificTrap {
+				t.Errorf("SpecificTrap mismatch: got %d, want %d",
+					response.SpecificTrap, tt.specificTrap)
+			}
+			if response.Timestamp != tt.timestamp {
+				t.Errorf("Timestamp mismatch: got %d, want %d",
+					response.Timestamp, tt.timestamp)
+			}
+		})
+	}
+}

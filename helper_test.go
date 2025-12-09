@@ -9,8 +9,11 @@ package gosnmp
 
 import (
 	"encoding/base64"
-	"testing"
+	"io"
+	"log"
 	"reflect"
+	"testing"
+
 	"github.com/stretchr/testify/assert"
 )
 
@@ -232,4 +235,394 @@ func checkByteEquality2(a, b []byte) bool {
 	}
 
 	return true
+}
+
+// TestParseRawFieldIPAddress tests parsing of IPAddress values with various
+// BER length encoding forms. Per X.690 §8.1.3.4 (short-form) and §8.1.3.5
+// (long-form), BER allows both single-byte length (0-127) and multi-byte length
+// encoding. RFC 3417 §8 explicitly permits senders to use long-form encoding
+// even when short-form would suffice (X.690 §8.1.3.5 NOTE 2).
+func TestParseRawFieldIPAddress(t *testing.T) {
+	tests := []struct {
+		name        string
+		data        []byte
+		expected    string
+		expectedLen int
+		wantErr     bool
+	}{
+		// Short-form BER length encoding (length byte < 128)
+		{
+			name: "IPv4_short_form",
+			// 0x40 = IPAddress type, 0x04 = length 4, followed by 192.168.1.1
+			data:        []byte{0x40, 0x04, 0xc0, 0xa8, 0x01, 0x01},
+			expected:    "192.168.1.1",
+			expectedLen: 6,
+		},
+		{
+			name: "IPv4_short_form_10_0_0_1",
+			// 0x40 = IPAddress type, 0x04 = length 4, followed by 10.0.0.1
+			data:        []byte{0x40, 0x04, 0x0a, 0x00, 0x00, 0x01},
+			expected:    "10.0.0.1",
+			expectedLen: 6,
+		},
+
+		// Long-form BER length encoding (first byte has high bit set)
+		{
+			name: "IPv4_long_form_one_octet",
+			// 0x40 = IPAddress type, 0x81 = long-form (1 length byte follows),
+			// 0x04 = length 4, followed by 192.168.1.1
+			data:        []byte{0x40, 0x81, 0x04, 0xc0, 0xa8, 0x01, 0x01},
+			expected:    "192.168.1.1",
+			expectedLen: 7,
+		},
+		{
+			name: "IPv4_long_form_two_octets",
+			// 0x40 = IPAddress type, 0x82 = long-form (2 length bytes follow),
+			// 0x00 0x04 = length 4, followed by 10.0.0.1
+			data:        []byte{0x40, 0x82, 0x00, 0x04, 0x0a, 0x00, 0x00, 0x01},
+			expected:    "10.0.0.1",
+			expectedLen: 8,
+		},
+
+		// Trailing data tests (verify length calculation for subsequent parsing)
+		{
+			name: "IPv4_short_form_with_trailing_data",
+			// Short-form encoded IP followed by additional bytes (simulates
+			// subsequent varbinds in an SNMP response)
+			data:        []byte{0x40, 0x04, 0xc0, 0xa8, 0x01, 0x01, 0x06, 0x05, 0x2b},
+			expected:    "192.168.1.1",
+			expectedLen: 6, // Length should not include trailing bytes
+		},
+		{
+			name: "IPv4_long_form_one_octet_with_trailing_data",
+			// Long-form encoded IP followed by additional bytes
+			data:        []byte{0x40, 0x81, 0x04, 0xc0, 0xa8, 0x01, 0x01, 0x06, 0x05, 0x2b},
+			expected:    "192.168.1.1",
+			expectedLen: 7, // Should not include trailing bytes
+		},
+
+		// Edge cases
+		{
+			name: "IPv4_zero_length",
+			// Some devices return zero-length IPAddress for missing data
+			data:        []byte{0x40, 0x00},
+			expected:    "",
+			expectedLen: 2,
+			wantErr:     false,
+		},
+	}
+
+	logger := NewLogger(log.New(io.Discard, "", 0))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, length, err := parseRawField(logger, tt.data, "test")
+
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("parseRawField() expected error, got nil")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("parseRawField() unexpected error: %v", err)
+				return
+			}
+
+			if length != tt.expectedLen {
+				t.Errorf("parseRawField() length = %v, want %v", length, tt.expectedLen)
+			}
+
+			// Handle nil value case (zero-length IPAddress)
+			if tt.expected == "" {
+				if result != nil {
+					t.Errorf("parseRawField() value = %v, want nil", result)
+				}
+				return
+			}
+
+			if result != tt.expected {
+				t.Errorf("parseRawField() value = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestDecodeValueIPAddress tests decoding of IPAddress values with various
+// BER length encoding forms. Per X.690 §8.1.3.4 (short-form) and §8.1.3.5
+// (long-form), BER allows both single-byte length (0-127) and multi-byte length
+// encoding. RFC 3417 §8 explicitly permits senders to use long-form encoding
+// even when short-form would suffice (X.690 §8.1.3.5 NOTE 2).
+func TestDecodeValueIPAddress(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		expected string
+		wantErr  bool
+	}{
+		// Short-form BER length encoding (length byte < 128)
+		{
+			name: "IPv4_short_form",
+			// 0x40 = IPAddress type, 0x04 = length 4, followed by 192.168.1.1
+			data:     []byte{0x40, 0x04, 0xc0, 0xa8, 0x01, 0x01},
+			expected: "192.168.1.1",
+		},
+		{
+			name: "IPv4_short_form_loopback",
+			// 0x40 = IPAddress type, 0x04 = length 4, followed by 127.0.0.1
+			data:     []byte{0x40, 0x04, 0x7f, 0x00, 0x00, 0x01},
+			expected: "127.0.0.1",
+		},
+		{
+			name: "IPv6_short_form",
+			// 0x40 = IPAddress type, 0x10 = length 16, followed by 2001:db8::1
+			// Note: Uses address with all 16 bytes to verify correct parsing boundary
+			data: []byte{
+				0x40, 0x10,
+				0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+			},
+			expected: "2001:db8::",
+		},
+
+		// Long-form BER length encoding (first byte has high bit set)
+		// Per X.690 8.1.3.5 NOTE 2: "it is a sender's option whether to use
+		// more length octets than the minimum necessary"
+		{
+			name: "IPv4_long_form_one_octet",
+			// 0x40 = IPAddress type, 0x81 = long-form (1 length byte follows),
+			// 0x04 = length 4, followed by 192.168.1.1
+			data:     []byte{0x40, 0x81, 0x04, 0xc0, 0xa8, 0x01, 0x01},
+			expected: "192.168.1.1",
+		},
+		{
+			name: "IPv4_long_form_two_octets",
+			// 0x40 = IPAddress type, 0x82 = long-form (2 length bytes follow),
+			// 0x00 0x04 = length 4, followed by 10.0.0.1
+			data:     []byte{0x40, 0x82, 0x00, 0x04, 0x0a, 0x00, 0x00, 0x01},
+			expected: "10.0.0.1",
+		},
+		{
+			name: "IPv6_long_form_one_octet",
+			// 0x40 = IPAddress type, 0x81 = long-form (1 length byte follows),
+			// 0x10 = length 16, followed by fe80::1
+			data: []byte{
+				0x40, 0x81, 0x10,
+				0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+			},
+			expected: "fe80::1",
+		},
+
+		// Trailing data tests (verify parsing ignores trailing bytes)
+		{
+			name: "IPv4_short_form_with_trailing_data",
+			// Short-form encoded IP followed by additional bytes (simulates
+			// subsequent varbinds in an SNMP response)
+			data:     []byte{0x40, 0x04, 0xc0, 0xa8, 0x01, 0x01, 0x06, 0x05, 0x2b},
+			expected: "192.168.1.1",
+		},
+		{
+			name: "IPv4_long_form_one_octet_with_trailing_data",
+			// Long-form encoded IP followed by additional bytes
+			data:     []byte{0x40, 0x81, 0x04, 0xc0, 0xa8, 0x01, 0x01, 0x06, 0x05, 0x2b},
+			expected: "192.168.1.1",
+		},
+
+		// Edge cases
+		{
+			name: "IPv4_zero_length",
+			// Some devices might return zero-length IPAddress for missing data
+			data:     []byte{0x40, 0x00},
+			expected: "",
+			wantErr:  false,
+		},
+	}
+
+	g := &GoSNMP{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var result variable
+			err := g.decodeValue(tt.data, &result)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("decodeValue() expected error, got nil")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("decodeValue() unexpected error: %v", err)
+				return
+			}
+
+			if result.Type != IPAddress {
+				t.Errorf("decodeValue() type = %v, want IPAddress", result.Type)
+			}
+
+			// Handle nil value case (zero-length IPAddress)
+			if tt.expected == "" {
+				if result.Value != nil {
+					t.Errorf("decodeValue() value = %v, want nil", result.Value)
+				}
+				return
+			}
+
+			if result.Value != tt.expected {
+				t.Errorf("decodeValue() value = %v, want %v", result.Value, tt.expected)
+			}
+		})
+	}
+}
+
+// TestDecodeValueOpaque tests decoding of Opaque values with various BER length
+// encoding forms. Per X.690 §8.1.3.4 (short-form) and §8.1.3.5 (long-form), BER
+// allows both single-byte length (0-127) and multi-byte length encoding.
+// RFC 3417 §8 explicitly permits senders to use long-form encoding even when
+// short-form would suffice (X.690 §8.1.3.5 NOTE 2).
+//
+// Opaque values may contain OpaqueFloat (0x78) or OpaqueDouble (0x79) extension
+// types, identified by the ASN.1 extension tag prefix (0x9F).
+func TestDecodeValueOpaque(t *testing.T) {
+	tests := []struct {
+		name         string
+		data         []byte
+		expectedType Asn1BER
+		expected     interface{}
+		wantErr      bool
+	}{
+		// Short-form BER length encoding (length byte < 128)
+		{
+			name: "Opaque_short_form_raw_data",
+			// 0x44 = Opaque type, 0x04 = length 4, followed by raw bytes
+			data:         []byte{0x44, 0x04, 0xde, 0xad, 0xbe, 0xef},
+			expectedType: Opaque,
+			expected:     []byte{0xde, 0xad, 0xbe, 0xef},
+		},
+		{
+			name: "OpaqueFloat_short_form",
+			// 0x44 = Opaque type, 0x07 = length 7
+			// 0x9f = ASN extension tag, 0x78 = OpaqueFloat, 0x04 = length 4
+			// 0x41 0x20 0x00 0x00 = float32(10.0)
+			data:         []byte{0x44, 0x07, 0x9f, 0x78, 0x04, 0x41, 0x20, 0x00, 0x00},
+			expectedType: OpaqueFloat,
+			expected:     float32(10.0),
+		},
+		{
+			name: "OpaqueDouble_short_form",
+			// 0x44 = Opaque type, 0x0b = length 11
+			// 0x9f = ASN extension tag, 0x79 = OpaqueDouble, 0x08 = length 8
+			// 0x40 0x24 0x00 0x00 0x00 0x00 0x00 0x00 = float64(10.0)
+			data:         []byte{0x44, 0x0b, 0x9f, 0x79, 0x08, 0x40, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			expectedType: OpaqueDouble,
+			expected:     float64(10.0),
+		},
+
+		// Long-form BER length encoding for outer Opaque wrapper
+		// Per X.690 8.1.3.5 NOTE 2: "it is a sender's option whether to use
+		// more length octets than the minimum necessary"
+		{
+			name: "Opaque_long_form_one_octet_raw_data",
+			// 0x44 = Opaque type, 0x81 = long-form (1 length byte follows),
+			// 0x04 = length 4, followed by raw bytes
+			data:         []byte{0x44, 0x81, 0x04, 0xde, 0xad, 0xbe, 0xef},
+			expectedType: Opaque,
+			expected:     []byte{0xde, 0xad, 0xbe, 0xef},
+		},
+		{
+			name: "OpaqueFloat_long_form_one_octet",
+			// 0x44 = Opaque type, 0x81 = long-form (1 length byte follows),
+			// 0x07 = length 7
+			// 0x9f = ASN extension tag, 0x78 = OpaqueFloat, 0x04 = length 4
+			// 0x41 0x20 0x00 0x00 = float32(10.0)
+			data:         []byte{0x44, 0x81, 0x07, 0x9f, 0x78, 0x04, 0x41, 0x20, 0x00, 0x00},
+			expectedType: OpaqueFloat,
+			expected:     float32(10.0),
+		},
+		{
+			name: "OpaqueFloat_long_form_two_octets",
+			// 0x44 = Opaque type, 0x82 = long-form (2 length bytes follow),
+			// 0x00 0x07 = length 7
+			// 0x9f = ASN extension tag, 0x78 = OpaqueFloat, 0x04 = length 4
+			// 0x41 0x20 0x00 0x00 = float32(10.0)
+			data:         []byte{0x44, 0x82, 0x00, 0x07, 0x9f, 0x78, 0x04, 0x41, 0x20, 0x00, 0x00},
+			expectedType: OpaqueFloat,
+			expected:     float32(10.0),
+		},
+		{
+			name: "OpaqueDouble_long_form_one_octet",
+			// 0x44 = Opaque type, 0x81 = long-form (1 length byte follows),
+			// 0x0b = length 11
+			// 0x9f = ASN extension tag, 0x79 = OpaqueDouble, 0x08 = length 8
+			// 0x40 0x24 0x00 0x00 0x00 0x00 0x00 0x00 = float64(10.0)
+			data:         []byte{0x44, 0x81, 0x0b, 0x9f, 0x79, 0x08, 0x40, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			expectedType: OpaqueDouble,
+			expected:     float64(10.0),
+		},
+
+		// Edge cases
+		{
+			name: "Opaque_zero_length",
+			// Some devices might return zero-length Opaque
+			data:         []byte{0x44, 0x00},
+			expectedType: Opaque,
+			wantErr:      true, // parseOpaque returns ErrZeroByteBuffer for empty data
+		},
+	}
+
+	g := &GoSNMP{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var result variable
+			err := g.decodeValue(tt.data, &result)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("decodeValue() expected error, got nil")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("decodeValue() unexpected error: %v", err)
+				return
+			}
+
+			if result.Type != tt.expectedType {
+				t.Errorf("decodeValue() type = %v, want %v", result.Type, tt.expectedType)
+			}
+
+			// Compare values based on type
+			switch expected := tt.expected.(type) {
+			case []byte:
+				resultBytes, ok := result.Value.([]byte)
+				if !ok {
+					t.Errorf("decodeValue() value type = %T, want []byte", result.Value)
+					return
+				}
+				if !reflect.DeepEqual(resultBytes, expected) {
+					t.Errorf("decodeValue() value = %x, want %x", resultBytes, expected)
+				}
+			case float32:
+				resultFloat, ok := result.Value.(float32)
+				if !ok {
+					t.Errorf("decodeValue() value type = %T, want float32", result.Value)
+					return
+				}
+				if resultFloat != expected {
+					t.Errorf("decodeValue() value = %v, want %v", resultFloat, expected)
+				}
+			case float64:
+				resultDouble, ok := result.Value.(float64)
+				if !ok {
+					t.Errorf("decodeValue() value type = %T, want float64", result.Value)
+					return
+				}
+				if resultDouble != expected {
+					t.Errorf("decodeValue() value = %v, want %v", resultDouble, expected)
+				}
+			}
+		})
+	}
 }
