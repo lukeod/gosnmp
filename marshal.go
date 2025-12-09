@@ -563,7 +563,12 @@ func (packet *SnmpPacket) marshalSNMPV1TrapHeader() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to marshal OID: %w", err)
 	}
-	buf.Write([]byte{byte(ObjectIdentifier), byte(len(oidBytes))})
+	oidLength, err := marshalLength(len(oidBytes))
+	if err != nil {
+		return nil, fmt.Errorf("unable to marshal OID length: %w", err)
+	}
+	buf.WriteByte(byte(ObjectIdentifier))
+	buf.Write(oidLength)
 	buf.Write(oidBytes)
 
 	// marshal AgentAddress (ip address)
@@ -761,7 +766,12 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 
 	case Integer:
 		// Oid
-		tmpBuf.Write([]byte{byte(ObjectIdentifier), byte(len(oid))})
+		oidLength, err := marshalLength(len(oid))
+		if err != nil {
+			return nil, fmt.Errorf("error marshalling OID length: %w", err)
+		}
+		tmpBuf.WriteByte(byte(ObjectIdentifier))
+		tmpBuf.Write(oidLength)
 		tmpBuf.Write(oid)
 
 		// Number
@@ -780,13 +790,22 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 		tmpBuf.Write(intBytes)
 
 		// Sequence, length of oid + integer, then oid/integer data
+		seqLength, err := marshalLength(tmpBuf.Len())
+		if err != nil {
+			return nil, fmt.Errorf("error marshalling sequence length: %w", err)
+		}
 		pduBuf.WriteByte(byte(Sequence))
-		pduBuf.WriteByte(byte(len(oid) + len(intBytes) + 4))
+		pduBuf.Write(seqLength)
 		pduBuf.Write(tmpBuf.Bytes())
 
 	case Counter32, Gauge32, TimeTicks, Uinteger32:
 		// Oid
-		tmpBuf.Write([]byte{byte(ObjectIdentifier), byte(len(oid))})
+		oidLength, err := marshalLength(len(oid))
+		if err != nil {
+			return nil, fmt.Errorf("error marshalling OID length: %w", err)
+		}
+		tmpBuf.WriteByte(byte(ObjectIdentifier))
+		tmpBuf.Write(oidLength)
 		tmpBuf.Write(oid)
 
 		// Number
@@ -807,13 +826,22 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 		tmpBuf.Write(intBytes)
 
 		// Sequence, length of oid + integer, then oid/integer data
+		seqLength, err := marshalLength(tmpBuf.Len())
+		if err != nil {
+			return nil, fmt.Errorf("error marshalling sequence length: %w", err)
+		}
 		pduBuf.WriteByte(byte(Sequence))
-		pduBuf.WriteByte(byte(len(oid) + len(intBytes) + 4))
+		pduBuf.Write(seqLength)
 		pduBuf.Write(tmpBuf.Bytes())
 
 	case OctetString, BitString, Opaque:
 		// Oid
-		tmpBuf.Write([]byte{byte(ObjectIdentifier), byte(len(oid))})
+		oidLength, err := marshalLength(len(oid))
+		if err != nil {
+			return nil, fmt.Errorf("error marshalling OID length: %w", err)
+		}
+		tmpBuf.WriteByte(byte(ObjectIdentifier))
+		tmpBuf.Write(oidLength)
 		tmpBuf.Write(oid)
 
 		// OctetString
@@ -850,7 +878,12 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 
 	case ObjectIdentifier:
 		// Oid
-		tmpBuf.Write([]byte{byte(ObjectIdentifier), byte(len(oid))})
+		oidLength, err := marshalLength(len(oid))
+		if err != nil {
+			return nil, fmt.Errorf("error marshalling OID length: %w", err)
+		}
+		tmpBuf.WriteByte(byte(ObjectIdentifier))
+		tmpBuf.Write(oidLength)
 		tmpBuf.Write(oid)
 		value := pdu.Value.(string)
 		oidBytes, err := marshalObjectIdentifier(value)
@@ -880,7 +913,12 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 
 	case IPAddress:
 		// Oid
-		tmpBuf.Write([]byte{byte(ObjectIdentifier), byte(len(oid))})
+		oidLength, err := marshalLength(len(oid))
+		if err != nil {
+			return nil, fmt.Errorf("error marshalling OID length: %w", err)
+		}
+		tmpBuf.WriteByte(byte(ObjectIdentifier))
+		tmpBuf.Write(oidLength)
 		tmpBuf.Write(oid)
 		// OctetString
 		var ipAddressBytes []byte
@@ -896,8 +934,12 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 		tmpBuf.Write([]byte{byte(IPAddress), byte(len(ipAddressBytes))})
 		tmpBuf.Write(ipAddressBytes)
 		// Sequence, length of oid + octetstring, then oid/octetstring data
+		seqLength, err := marshalLength(tmpBuf.Len())
+		if err != nil {
+			return nil, fmt.Errorf("error marshalling sequence length: %w", err)
+		}
 		pduBuf.WriteByte(byte(Sequence))
-		pduBuf.WriteByte(byte(len(oid) + len(ipAddressBytes) + 4))
+		pduBuf.Write(seqLength)
 		pduBuf.Write(tmpBuf.Bytes())
 
 	case OpaqueFloat, OpaqueDouble:
@@ -924,7 +966,12 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("error marshalling Float type length: %w", err)
 		}
-		tmpBuf.Write([]byte{byte(ObjectIdentifier), byte(len(oid))})
+		oidLength, err := marshalLength(len(oid))
+		if err != nil {
+			return nil, fmt.Errorf("error marshalling OID length: %w", err)
+		}
+		tmpBuf.WriteByte(byte(ObjectIdentifier))
+		tmpBuf.Write(oidLength)
 		tmpBuf.Write(oid)
 		tmpBuf.WriteByte(byte(Opaque))
 		tmpBuf.Write(opaqueLength)
@@ -941,7 +988,12 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 		pduBuf.Write(tmpBuf.Bytes())
 
 	case Counter64:
-		tmpBuf.Write([]byte{byte(ObjectIdentifier), byte(len(oid))})
+		oidLength, err := marshalLength(len(oid))
+		if err != nil {
+			return nil, fmt.Errorf("error marshalling OID length: %w", err)
+		}
+		tmpBuf.WriteByte(byte(ObjectIdentifier))
+		tmpBuf.Write(oidLength)
 		tmpBuf.Write(oid)
 		tmpBuf.WriteByte(byte(pdu.Type))
 		intBytes, err := marshalUint64(pdu.Value)
@@ -953,7 +1005,7 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 		tmpBytes := tmpBuf.Bytes()
 		length, err := marshalLength(len(tmpBytes))
 		if err != nil {
-			return nil, fmt.Errorf("error marshalling Float type length: %w", err)
+			return nil, fmt.Errorf("error marshalling Counter64 type length: %w", err)
 		}
 		// Sequence, length of oid + oid, then oid/oid data
 		pduBuf.WriteByte(byte(Sequence))
@@ -961,7 +1013,12 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 		pduBuf.Write(tmpBytes)
 
 	case NoSuchInstance, NoSuchObject, EndOfMibView:
-		tmpBuf.Write([]byte{byte(ObjectIdentifier), byte(len(oid))})
+		oidLength, err := marshalLength(len(oid))
+		if err != nil {
+			return nil, fmt.Errorf("error marshalling OID length: %w", err)
+		}
+		tmpBuf.WriteByte(byte(ObjectIdentifier))
+		tmpBuf.Write(oidLength)
 		tmpBuf.Write(oid)
 		tmpBuf.WriteByte(byte(pdu.Type))
 		tmpBuf.WriteByte(byte(EndOfContents))
