@@ -442,6 +442,34 @@ func marshalLength(length int) ([]byte, error) {
 	return append(header, bufBytes...), nil
 }
 
+// marshalOID writes an ObjectIdentifier TLV (type-length-value) to buf using
+// proper BER length encoding. This handles OIDs of any size, including those
+// exceeding 127 bytes which require long-form length encoding.
+func marshalOID(buf *bytes.Buffer, oid []byte) error {
+	length, err := marshalLength(len(oid))
+	if err != nil {
+		return fmt.Errorf("error marshalling OID length: %w", err)
+	}
+	buf.WriteByte(byte(ObjectIdentifier))
+	buf.Write(length)
+	buf.Write(oid)
+	return nil
+}
+
+// marshalSequence writes a SEQUENCE wrapper around content to pduBuf using
+// proper BER length encoding. This handles sequences of any size, including
+// those exceeding 127 bytes which require long-form length encoding.
+func marshalSequence(pduBuf *bytes.Buffer, content []byte) error {
+	length, err := marshalLength(len(content))
+	if err != nil {
+		return fmt.Errorf("error marshalling sequence length: %w", err)
+	}
+	pduBuf.WriteByte(byte(Sequence))
+	pduBuf.Write(length)
+	pduBuf.Write(content)
+	return nil
+}
+
 func marshalObjectIdentifier(oid string) ([]byte, error) {
 	out := new(bytes.Buffer)
 	oidLength := len(oid)
