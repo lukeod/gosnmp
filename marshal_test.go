@@ -2297,10 +2297,17 @@ func TestMarshalVarbindLargeOID(t *testing.T) {
 			g := &GoSNMP{}
 			g.Logger = NewLogger(log.New(io.Discard, "", 0))
 
-			// The marshaled varbind is wrapped in a SEQUENCE, so we can parse
-			// it as a VBL containing one varbind
+			// Wrap the varbind in a VBL sequence for unmarshalVBL
+			vblLength, err := marshalLength(len(data))
+			if err != nil {
+				t.Errorf("marshalLength() failed: %v", err)
+				return
+			}
+			vblData := append([]byte{byte(Sequence)}, vblLength...)
+			vblData = append(vblData, data...)
+
 			response := &SnmpPacket{}
-			err = g.unmarshalVBL(data, response)
+			err = g.unmarshalVBL(vblData, response)
 			if err != nil {
 				t.Errorf("unmarshalVBL() failed to parse marshaled data: %v", err)
 				return
@@ -2347,8 +2354,18 @@ func TestMarshalVarbindLargeOIDCounter64(t *testing.T) {
 	// Verify round-trip: unmarshal should succeed if length encoding is correct
 	g := &GoSNMP{}
 	g.Logger = NewLogger(log.New(io.Discard, "", 0))
+
+	// Wrap the varbind in a VBL sequence for unmarshalVBL
+	vblLength, err := marshalLength(len(data))
+	if err != nil {
+		t.Errorf("marshalLength() failed: %v", err)
+		return
+	}
+	vblData := append([]byte{byte(Sequence)}, vblLength...)
+	vblData = append(vblData, data...)
+
 	response := &SnmpPacket{}
-	err = g.unmarshalVBL(data, response)
+	err = g.unmarshalVBL(vblData, response)
 	if err != nil {
 		t.Errorf("unmarshalVBL() failed to parse marshaled Counter64 data: %v", err)
 		return
@@ -2402,8 +2419,18 @@ func TestMarshalVarbindLargeOIDNoSuchTypes(t *testing.T) {
 			// Verify round-trip
 			g := &GoSNMP{}
 			g.Logger = NewLogger(log.New(io.Discard, "", 0))
+
+			// Wrap the varbind in a VBL sequence for unmarshalVBL
+			vblLength, err := marshalLength(len(data))
+			if err != nil {
+				t.Errorf("marshalLength() failed: %v", err)
+				return
+			}
+			vblData := append([]byte{byte(Sequence)}, vblLength...)
+			vblData = append(vblData, data...)
+
 			response := &SnmpPacket{}
-			err = g.unmarshalVBL(data, response)
+			err = g.unmarshalVBL(vblData, response)
 			if err != nil {
 				t.Errorf("unmarshalVBL() failed to parse marshaled %s data: %v", tt.name, err)
 				return
