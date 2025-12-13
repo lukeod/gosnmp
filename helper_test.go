@@ -343,3 +343,25 @@ func TestParseLength(t *testing.T) {
 		})
 	}
 }
+
+// TestParseLengthLongFormIPAddress tests that IPAddress parsing works with long-form BER lengths
+func TestParseLengthLongFormIPAddress(t *testing.T) {
+	// Test case: IPAddress with long-form length encoding (0x81 0x04 instead of just 0x04)
+	// Format: type(0x40) + length(0x81 0x04) + 4 bytes of IP
+	longFormIP := []byte{0x40, 0x81, 0x04, 192, 168, 1, 1}
+
+	x := &GoSNMP{}
+	retVal := &variable{}
+	err := x.decodeValue(longFormIP, retVal)
+	if err != nil {
+		t.Fatalf("decodeValue() with long-form IPAddress failed: %v", err)
+	}
+
+	expectedIP := "192.168.1.1"
+	if retVal.Value != expectedIP {
+		t.Errorf("decodeValue() = %v, want %v", retVal.Value, expectedIP)
+	}
+	if retVal.Type != IPAddress {
+		t.Errorf("decodeValue() type = %v, want IPAddress", retVal.Type)
+	}
+}
