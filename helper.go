@@ -660,7 +660,7 @@ func parseInt(bytes []byte) (int, error) {
 func parseLength(bytes []byte) (int, int, error) {
 	var cursor, length int
 	switch {
-	case len(bytes) <= 2:
+	case len(bytes) < 2:
 		// handle null octet strings ie "0x04 0x00"
 		cursor = len(bytes)
 		length = len(bytes)
