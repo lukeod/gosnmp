@@ -313,9 +313,9 @@ func TestParseLength(t *testing.T) {
 		},
 		// Invalid long form data
 		{
-			name:       "truncated long form length",
-			data:       []byte{0x04, 0x82, 0x01}, // missing second length byte
-			wantErr:    true,
+			name:    "truncated long form length",
+			data:    []byte{0x04, 0x82, 0x01}, // missing second length byte
+			wantErr: true,
 		},
 	}
 

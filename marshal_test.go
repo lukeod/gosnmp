@@ -2088,3 +2088,98 @@ func dumpBytes2(desc string, bb []byte, cursor int) string {
 	}
 	return result
 }
+
+// TestMarshalLargeOID tests that OIDs > 127 bytes use long-form BER length encoding
+func TestMarshalLargeOID(t *testing.T) {
+	// Create a large OID that will exceed 127 bytes when encoded
+	// Start with a base OID and add many sub-identifiers
+	largeOID := ".1.3.6.1.4.1"
+	for i := 0; i < 50; i++ {
+		largeOID += ".999999999" // Each large sub-id uses multiple bytes
+	}
+
+	pdu := SnmpPDU{
+		Name:  largeOID,
+		Type:  Integer,
+		Value: 42,
+	}
+
+	result, err := marshalVarbind(&pdu)
+	if err != nil {
+		t.Fatalf("marshalVarbind() for large OID failed: %v", err)
+	}
+
+	// Verify that the result starts with SEQUENCE tag
+	if result[0] != byte(Sequence) {
+		t.Errorf("expected SEQUENCE tag (0x30), got 0x%02x", result[0])
+	}
+
+	// For a large varbind, the length should use long-form encoding (0x81 or 0x82)
+	// A valid long-form length has bit 7 set (value >= 0x80)
+	if result[1] < 0x80 {
+		t.Logf("result length byte: 0x%02x, total len: %d", result[1], len(result))
+		// It might still be short form if the total is <= 127, check actual size
+		if len(result) > 129 { // 127 + 2 for tag+length
+			t.Errorf("large OID varbind should use long-form length, got short form 0x%02x", result[1])
+		}
+	}
+
+	// Verify the OID type tag appears in the result
+	foundOIDTag := false
+	for i := 0; i < len(result)-1; i++ {
+		if result[i] == byte(ObjectIdentifier) {
+			foundOIDTag = true
+			// Next byte(s) should be the length - check it is reasonable
+			break
+		}
+	}
+	if !foundOIDTag {
+		t.Error("OID tag not found in marshaled result")
+	}
+}
+
+// TestMarshalOIDHelper tests the marshalOID helper function directly
+func TestMarshalOIDHelper(t *testing.T) {
+	tests := []struct {
+		name       string
+		oidLen     int
+		wantLenTag byte // Expected first byte of length (0x00-0x7F for short, 0x81+ for long)
+	}{
+		{"short form OID (10 bytes)", 10, 0x0A},
+		{"short form max (126 bytes)", 126, 0x7E},
+		{"long form (128 bytes)", 128, 0x81}, // 0x81 0x80
+		{"long form (200 bytes)", 200, 0x81}, // 0x81 0xC8
+		{"long form (300 bytes)", 300, 0x82}, // 0x82 0x01 0x2C
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := new(bytes.Buffer)
+			oid := make([]byte, tt.oidLen)
+
+			err := marshalOID(buf, oid)
+			if err != nil {
+				t.Fatalf("marshalOID() error = %v", err)
+			}
+
+			result := buf.Bytes()
+			// First byte should be ObjectIdentifier tag
+			if result[0] != byte(ObjectIdentifier) {
+				t.Errorf("expected OID tag 0x06, got 0x%02x", result[0])
+			}
+
+			// Check length encoding
+			if tt.oidLen < 127 {
+				// Short form: length byte should equal the length
+				if result[1] != byte(tt.oidLen) {
+					t.Errorf("short form length = 0x%02x, want 0x%02x", result[1], tt.oidLen)
+				}
+			} else {
+				// Long form: first length byte has bit 7 set
+				if result[1] < 0x80 {
+					t.Errorf("long form expected (len=%d), but got short form 0x%02x", tt.oidLen, result[1])
+				}
+			}
+		})
+	}
+}
