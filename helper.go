@@ -419,7 +419,8 @@ func marshalLength(length int) ([]byte, error) {
 	// more convenient to pass length as int than uint64. Therefore check < 0
 	if length < 0 {
 		return nil, fmt.Errorf("length must be greater than zero")
-	} else if length < 127 {
+	} else if length <= 127 {
+		// Short form: length 0-127 can be encoded in a single byte with bit 7 clear
 		return []byte{byte(length)}, nil
 	}
 

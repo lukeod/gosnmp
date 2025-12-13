@@ -2146,10 +2146,10 @@ func TestMarshalOIDHelper(t *testing.T) {
 		wantLenTag byte // Expected first byte of length (0x00-0x7F for short, 0x81+ for long)
 	}{
 		{"short form OID (10 bytes)", 10, 0x0A},
-		{"short form max (126 bytes)", 126, 0x7E},
-		{"long form (128 bytes)", 128, 0x81}, // 0x81 0x80
-		{"long form (200 bytes)", 200, 0x81}, // 0x81 0xC8
-		{"long form (300 bytes)", 300, 0x82}, // 0x82 0x01 0x2C
+		{"short form max (127 bytes)", 127, 0x7F},
+		{"long form min (128 bytes)", 128, 0x81}, // 0x81 0x80
+		{"long form (200 bytes)", 200, 0x81},     // 0x81 0xC8
+		{"long form (300 bytes)", 300, 0x82},     // 0x82 0x01 0x2C
 	}
 
 	for _, tt := range tests {
@@ -2169,7 +2169,7 @@ func TestMarshalOIDHelper(t *testing.T) {
 			}
 
 			// Check length encoding
-			if tt.oidLen < 127 {
+			if tt.oidLen <= 127 {
 				// Short form: length byte should equal the length
 				if result[1] != byte(tt.oidLen) {
 					t.Errorf("short form length = 0x%02x, want 0x%02x", result[1], tt.oidLen)

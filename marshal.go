@@ -817,7 +817,8 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 			return nil, fmt.Errorf("unable to marshal PDU OctetString; not []byte or string")
 		}
 
-		length, err := marshalLength(len(octetStringBytes))
+		var length []byte
+		length, err = marshalLength(len(octetStringBytes))
 		if err != nil {
 			return nil, fmt.Errorf("unable to marshal PDU length: %w", err)
 		}
@@ -834,13 +835,15 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 			return nil, err
 		}
 		value := pdu.Value.(string)
-		oidBytes, err := marshalObjectIdentifier(value)
+		var oidBytes []byte
+		oidBytes, err = marshalObjectIdentifier(value)
 		if err != nil {
 			return nil, fmt.Errorf("error marshalling ObjectIdentifier: %w", err)
 		}
 
 		// Oid data
-		length, err := marshalLength(len(oidBytes))
+		var length []byte
+		length, err = marshalLength(len(oidBytes))
 		if err != nil {
 			return nil, fmt.Errorf("error marshalling ObjectIdentifier length: %w", err)
 		}
@@ -884,18 +887,21 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 		intBuf := new(bytes.Buffer)
 		intBuf.WriteByte(byte(AsnExtensionTag))
 		intBuf.WriteByte(byte(pdu.Type))
-		intBytes, err := converters[pdu.Type](pdu.Value)
+		var intBytes []byte
+		intBytes, err = converters[pdu.Type](pdu.Value)
 		if err != nil {
 			return nil, fmt.Errorf("error converting PDU value type %v to %v: %w", pdu.Value, pdu.Type, err)
 		}
-		intLength, err := marshalLength(len(intBytes))
+		var intLength []byte
+		intLength, err = marshalLength(len(intBytes))
 		if err != nil {
 			return nil, fmt.Errorf("error marshalling Float type length: %w", err)
 		}
 		intBuf.Write(intLength)
 		intBuf.Write(intBytes)
 
-		opaqueLength, err := marshalLength(len(intBuf.Bytes()))
+		var opaqueLength []byte
+		opaqueLength, err = marshalLength(len(intBuf.Bytes()))
 		if err != nil {
 			return nil, fmt.Errorf("error marshalling Opaque length: %w", err)
 		}
@@ -915,7 +921,8 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 			return nil, err
 		}
 		tmpBuf.WriteByte(byte(pdu.Type))
-		intBytes, err := marshalUint64(pdu.Value)
+		var intBytes []byte
+		intBytes, err = marshalUint64(pdu.Value)
 		if err != nil {
 			return nil, fmt.Errorf("error marshalling: %w", err)
 		}
