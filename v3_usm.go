@@ -153,6 +153,15 @@ type UsmSecurityParameters struct {
 	PrivacyKey []byte
 
 	Logger Logger
+
+	// authenticatedTimeValues is true if AuthoritativeEngineBoots/Time were
+	// received from an authenticated message. Once set, unauthenticated
+	// messages cannot overwrite the time values (per RFC 3414 §3.2 step 7).
+	authenticatedTimeValues bool
+
+	// authenticated indicates this instance's time values came from an
+	// authenticated packet. Set before calling setSecurityParameters.
+	authenticated bool
 }
 
 func (sp *UsmSecurityParameters) getIdentifier() string {
@@ -259,6 +268,8 @@ func (sp *UsmSecurityParameters) Copy() SnmpV3SecurityParameters {
 		localDESSalt:             sp.localDESSalt,
 		localAESSalt:             sp.localAESSalt,
 		Logger:                   sp.Logger,
+		authenticatedTimeValues:  sp.authenticatedTimeValues,
+		authenticated:            sp.authenticated,
 	}
 }
 
@@ -329,8 +340,15 @@ func (sp *UsmSecurityParameters) setSecurityParameters(in SnmpV3SecurityParamete
 			return err
 		}
 	}
-	sp.AuthoritativeEngineBoots = insp.AuthoritativeEngineBoots
-	sp.AuthoritativeEngineTime = insp.AuthoritativeEngineTime
+
+	// Only update time values if the incoming values are authenticated OR we don't
+	// have authenticated values yet. This prevents unauthenticated REPORTs from
+	// overwriting previously authenticated time values (RFC 3414 §3.2 step 7).
+	if insp.authenticated || !sp.authenticatedTimeValues {
+		sp.AuthoritativeEngineBoots = insp.AuthoritativeEngineBoots
+		sp.AuthoritativeEngineTime = insp.AuthoritativeEngineTime
+		sp.authenticatedTimeValues = insp.authenticated
+	}
 
 	return nil
 }

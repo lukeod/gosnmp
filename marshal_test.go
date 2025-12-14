@@ -13,14 +13,17 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Tests in alphabetical order of function being tested
@@ -2274,5 +2277,831 @@ func TestMarshalTLV(t *testing.T) {
 				t.Errorf("total length = %d, want %d", len(result), expectedTotal)
 			}
 		})
+	}
+}
+
+func TestSNMPv3_UpdatesEngineTimeOnReport(t *testing.T) {
+	// --- Test fixtures -------------------------------------------------------
+	// These are the specific engine times observed in the real UniFi capture.
+	// The client initially believes engineTime=207512 (stale) while the agent
+	// reports 1094073 as the authoritative time through a REPORT PDU.
+	const (
+		engineTimeOld = uint32(207512)  // stale time sent by the client first
+		engineTimeNew = uint32(1094073) // authoritative time from the agent REPORT
+	)
+
+	// Wireshark Frame 2 (UDP payload = SNMP BER message).
+	// This is a REPORT with msgFlags=NoAuthNoPriv and carries the agent's
+	// authoritative engineBoots/engineTime in the USM header. We inject this
+	// as the server's first reply to trigger client resync.
+	var deviceReportFrame2 = mustHex(
+		"306d020103301002040c6e214f020205c004010002010304243022040d80001f88801cae0f4e0000001d020101020310b1b9040561646d696e040004003030040d80001f88801cae0f4e0000001d0400a81d02010002010002010030123010060a2b060106030f0101020041021e5d",
+	)
+
+	// Start a mock UDP "device" that:
+	//   1) captures the client's first datagram (should contain engineTimeOld),
+	//   2) replies with the REPORT (above),
+	//   3) captures the client's immediate retry (should contain engineTimeNew).
+	ap := startMockUniFiAP(t, deviceReportFrame2)
+
+	// --- Client setup --------------------------------------------------------
+	// Configure gosnmp to talk to the mock "device" with a stale engineTime.
+	// Retries=0 ensures we're testing the inline REPORT-driven resend,
+	// not outer retry logic.
+	g := &GoSNMP{
+		Target:        func() string { ip, _ := ap.Addr(); return ip }(),
+		Port:          func() uint16 { _, p := ap.Addr(); return p }(),
+		Transport:     "udp",
+		Version:       Version3,
+		Timeout:       1500 * time.Millisecond, // enough for the two packet round-trip in test
+		Retries:       0,
+		MsgFlags:      AuthNoPriv,
+		SecurityModel: UserSecurityModel,
+		SecurityParameters: &UsmSecurityParameters{
+			UserName:                 "admin",
+			AuthenticationProtocol:   SHA,
+			AuthenticationPassphrase: "pass",
+			// Engine ID must match the REPORT packet (from Wireshark frame 2).
+			// The REPORT's USM header contains this engine ID.
+			AuthoritativeEngineID:    string(mustHex("80001f88801cae0f4e0000001d")),
+			AuthoritativeEngineBoots: 1,
+			AuthoritativeEngineTime:  engineTimeOld, // seed with stale time
+		},
+	}
+	require.NoError(t, g.Connect(), "Connect")
+	t.Cleanup(func() { _ = g.Conn.Close() })
+
+	// --- Exercise ------------------------------------------------------------
+	// Any v3 request works; we use sysUpTime.0. The mock replies with a REPORT
+	// (NoAuthNoPriv). The client must:
+	//   - skip auth check for that REPORT,
+	//   - parse/adopt authoritative engineBoots/engineTime from its header,
+	//   - immediately resend the *same* request with the corrected time.
+	_, _ = g.Get([]string{"1.3.6.1.2.1.1.3.0"})
+
+	// Give the mock time to receive the client's second write (resend after REPORT).
+	ap.WaitSecond(2 * time.Second)
+
+	// --- Verify: first write had OLD time -----------------------------------
+	firstWrite := ap.FirstWrite()
+	require.NotEmpty(t, firstWrite, "expected at least 1 client write (initial request)")
+	oldBER := berInt(engineTimeOld) // BER-encoded INTEGER for engineTimeOld
+	require.Truef(t, bytes.Contains(firstWrite, oldBER),
+		"first client write should contain old engineTime %d (BER %x)\nfirst write (hex):\n%s",
+		engineTimeOld, oldBER, hex.Dump(firstWrite))
+
+	// --- Verify: second write exists and has NEW time -----------------------
+	// This proves the inline REPORT handling kicked in and the engine time was updated
+	// *within the same attempt* (no outer retry consumption).
+	secondWrite := ap.SecondWrite()
+	require.NotEmptyf(t, secondWrite,
+		"expected a second client write (inline retry after REPORT), but got only one write\nfirst write (hex):\n%s",
+		hex.Dump(firstWrite))
+
+	newBER := berInt(engineTimeNew) // BER-encoded INTEGER for engineTimeNew
+	assert.Truef(t, bytes.Contains(secondWrite, newBER),
+		"second client write did not update engineTime to %d (BER %x)\nsecond write (hex):\n%s",
+		engineTimeNew, newBER, hex.Dump(secondWrite))
+
+	// Sanity: ensure the old value is *not* still present in the resend.
+	assert.Falsef(t, bytes.Contains(secondWrite, oldBER),
+		"second client write should not still contain old engineTime %d (BER %x)\nsecond write (hex):\n%s",
+		engineTimeOld, oldBER, hex.Dump(secondWrite))
+
+	// --- Verify: session USM state updated ----------------------------------
+	// After processing the REPORT, the client's USM should keep the authoritative
+	// engineTime so future requests are in-window.
+	if usp, ok := g.SecurityParameters.(*UsmSecurityParameters); assert.True(t, ok, "expected UsmSecurityParameters") {
+		assert.Equal(t, engineTimeNew, usp.AuthoritativeEngineTime,
+			"client USM should adopt authoritative engineTime from REPORT")
+	}
+}
+
+// mockUniFiAP simulates a UniFi AP that replies with a v3 REPORT (NoAuthNoPriv)
+// carrying authoritative engine params, then waits for the client's immediate retry.
+type mockUniFiAP struct {
+	t      *testing.T
+	conn   *net.UDPConn
+	addr   *net.UDPAddr
+	report []byte
+
+	mu          sync.Mutex
+	firstWrite  []byte
+	secondWrite []byte
+	gotSecond   chan struct{}
+}
+
+func startMockUniFiAP(t *testing.T, report []byte) *mockUniFiAP {
+	t.Helper()
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{})
+	require.NoError(t, err, "listen udp")
+
+	m := &mockUniFiAP{
+		t:         t,
+		conn:      c,
+		addr:      c.LocalAddr().(*net.UDPAddr),
+		report:    append([]byte(nil), report...),
+		gotSecond: make(chan struct{}, 1),
+	}
+
+	// single exchange goroutine
+	go m.runOnce()
+	t.Cleanup(func() { _ = m.conn.Close() })
+	return m
+}
+
+func (m *mockUniFiAP) runOnce() {
+	buf := make([]byte, 8192)
+
+	// 1st datagram from client
+	_ = m.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, clientAddr, err := m.conn.ReadFromUDP(buf)
+	if err != nil {
+		return
+	}
+	m.mu.Lock()
+	m.firstWrite = append([]byte{}, buf[:n]...)
+	m.mu.Unlock()
+
+	// Send REPORT (authoritative engineTime)
+	_, _ = m.conn.WriteToUDP(m.report, clientAddr)
+
+	// 2nd datagram from client (immediate retry)
+	_ = m.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n2, _, err2 := m.conn.ReadFromUDP(buf)
+	if err2 == nil {
+		m.mu.Lock()
+		m.secondWrite = append([]byte{}, buf[:n2]...)
+		m.mu.Unlock()
+		m.gotSecond <- struct{}{}
+	}
+}
+
+func (m *mockUniFiAP) Addr() (ip string, port uint16) {
+	return m.addr.IP.String(), uint16(m.addr.Port)
+}
+
+func (m *mockUniFiAP) WaitSecond(d time.Duration) {
+	select {
+	case <-m.gotSecond:
+	case <-time.After(d):
+	}
+}
+
+func (m *mockUniFiAP) FirstWrite() []byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]byte{}, m.firstWrite...)
+}
+
+func (m *mockUniFiAP) SecondWrite() []byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]byte{}, m.secondWrite...)
+}
+
+// BER INTEGER for positive ints: 0x02 <len> <big-endian>
+func berInt(v uint32) []byte {
+	if v == 0 {
+		return []byte{0x02, 0x01, 0x00}
+	}
+	b := []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
+	i := 0
+	for i < len(b)-1 && b[i] == 0x00 {
+		i++
+	}
+	be := b[i:]
+	if be[0]&0x80 != 0 {
+		be = append([]byte{0x00}, be...)
+	}
+	return append([]byte{0x02, byte(len(be))}, be...)
+}
+
+func mustHex(s string) []byte {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// Tests for SNMPv3 helper functions
+
+func TestIsValidRequestID(t *testing.T) {
+	tests := []struct {
+		name      string
+		resultID  uint32
+		pduType   PDUType
+		allReqIDs []uint32
+		want      bool
+	}{
+		{
+			name:      "requestID 0 is valid for Report PDU",
+			resultID:  0,
+			pduType:   Report,
+			allReqIDs: []uint32{123, 456},
+			want:      true,
+		},
+		{
+			name:      "requestID 0 is NOT valid for non-Report PDU",
+			resultID:  0,
+			pduType:   GetResponse,
+			allReqIDs: []uint32{123, 456},
+			want:      false,
+		},
+		{
+			name:      "exact match first",
+			resultID:  123,
+			pduType:   GetResponse,
+			allReqIDs: []uint32{123, 456, 789},
+			want:      true,
+		},
+		{
+			name:      "exact match middle",
+			resultID:  456,
+			pduType:   GetResponse,
+			allReqIDs: []uint32{123, 456, 789},
+			want:      true,
+		},
+		{
+			name:      "exact match last",
+			resultID:  789,
+			pduType:   GetResponse,
+			allReqIDs: []uint32{123, 456, 789},
+			want:      true,
+		},
+		{
+			name:      "no match",
+			resultID:  999,
+			pduType:   GetResponse,
+			allReqIDs: []uint32{123, 456, 789},
+			want:      false,
+		},
+		{
+			name:      "no match empty list",
+			resultID:  123,
+			pduType:   GetResponse,
+			allReqIDs: []uint32{},
+			want:      false,
+		},
+		{
+			name:      "single element match",
+			resultID:  42,
+			pduType:   GetResponse,
+			allReqIDs: []uint32{42},
+			want:      true,
+		},
+		{
+			name:      "single element no match",
+			resultID:  42,
+			pduType:   GetResponse,
+			allReqIDs: []uint32{99},
+			want:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isValidRequestID(tt.resultID, tt.pduType, tt.allReqIDs)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestIsV3ErrorNonRetriable(t *testing.T) {
+	v3Errors := []struct {
+		name string
+		err  error
+	}{
+		{"ErrNotInTimeWindow", ErrNotInTimeWindow},
+		{"ErrUnknownEngineID", ErrUnknownEngineID},
+		{"ErrWrongDigest", ErrWrongDigest},
+		{"ErrUnknownSecurityLevel", ErrUnknownSecurityLevel},
+		{"ErrUnknownUsername", ErrUnknownUsername},
+		{"ErrDecryption", ErrDecryption},
+		{"ErrUnknownSecurityModels", ErrUnknownSecurityModels},
+		{"ErrInvalidMsgs", ErrInvalidMsgs},
+		{"ErrUnknownPDUHandlers", ErrUnknownPDUHandlers},
+		{"ErrUnknownReportPDU", ErrUnknownReportPDU},
+	}
+
+	for _, tc := range v3Errors {
+		t.Run(tc.name+"_direct", func(t *testing.T) {
+			assert.True(t, isV3ErrorNonRetriable(tc.err),
+				"%s should be non-retriable", tc.name)
+		})
+
+		t.Run(tc.name+"_wrapped", func(t *testing.T) {
+			wrapped := fmt.Errorf("context: %w", tc.err)
+			assert.True(t, isV3ErrorNonRetriable(wrapped),
+				"wrapped %s should be non-retriable", tc.name)
+		})
+	}
+
+	t.Run("generic_error_retriable", func(t *testing.T) {
+		err := fmt.Errorf("some generic error")
+		assert.False(t, isV3ErrorNonRetriable(err),
+			"generic error should be retriable")
+	})
+
+	t.Run("io_EOF_retriable", func(t *testing.T) {
+		assert.False(t, isV3ErrorNonRetriable(io.EOF),
+			"io.EOF should be retriable")
+	})
+
+	t.Run("nil_error_retriable", func(t *testing.T) {
+		assert.False(t, isV3ErrorNonRetriable(nil),
+			"nil error should be retriable")
+	})
+}
+
+type mockNetError struct {
+	timeout   bool
+	temporary bool
+}
+
+func (e *mockNetError) Error() string   { return "mock net error" }
+func (e *mockNetError) Timeout() bool   { return e.timeout }
+func (e *mockNetError) Temporary() bool { return e.temporary }
+
+func TestIsTimeoutError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "net.Error with Timeout()=true",
+			err:  &mockNetError{timeout: true},
+			want: true,
+		},
+		{
+			name: "net.Error with Timeout()=false",
+			err:  &mockNetError{timeout: false},
+			want: false,
+		},
+		{
+			name: "generic error",
+			err:  fmt.Errorf("some error"),
+			want: false,
+		},
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "io.EOF",
+			err:  io.EOF,
+			want: false,
+		},
+		{
+			name: "os.ErrDeadlineExceeded",
+			err:  os.ErrDeadlineExceeded,
+			want: true,
+		},
+		{
+			name: "wrapped os.ErrDeadlineExceeded",
+			err:  fmt.Errorf("context: %w", os.ErrDeadlineExceeded),
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isTimeoutError(tt.err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestPeekV3PDUType(t *testing.T) {
+	logger := NewLogger(log.New(io.Discard, "", 0))
+
+	buildScopedPDU := func(pduType PDUType) []byte {
+		ctxEngineID := []byte{0x04, 0x05, 't', 'e', 's', 't', '1'}
+		ctxName := []byte{0x04, 0x04, 't', 'e', 's', 't'}
+		pduTag := byte(pduType)
+		inner := append(ctxEngineID, ctxName...)
+		inner = append(inner, pduTag)
+		result := []byte{0x30, byte(len(inner))}
+		result = append(result, inner...)
+		return result
+	}
+
+	t.Run("valid_Report_PDU", func(t *testing.T) {
+		data := buildScopedPDU(Report)
+		pduType, ok := peekV3PDUType(data, 0, logger)
+		assert.True(t, ok, "should successfully peek Report")
+		assert.Equal(t, Report, pduType)
+	})
+
+	t.Run("valid_GetResponse_PDU", func(t *testing.T) {
+		data := buildScopedPDU(GetResponse)
+		pduType, ok := peekV3PDUType(data, 0, logger)
+		assert.True(t, ok, "should successfully peek GetResponse")
+		assert.Equal(t, GetResponse, pduType)
+	})
+
+	t.Run("valid_GetRequest_PDU", func(t *testing.T) {
+		data := buildScopedPDU(GetRequest)
+		pduType, ok := peekV3PDUType(data, 0, logger)
+		assert.True(t, ok, "should successfully peek GetRequest")
+		assert.Equal(t, GetRequest, pduType)
+	})
+
+	t.Run("encrypted_ScopedPDU_OctetString_tag", func(t *testing.T) {
+		// Encrypted ScopedPDU starts with OctetString (0x04) not SEQUENCE (0x30)
+		data := []byte{0x04, 0x10, 0x00, 0x01, 0x02, 0x03} // OctetString tag
+		pduType, ok := peekV3PDUType(data, 0, logger)
+		assert.False(t, ok, "should fail for encrypted ScopedPDU")
+		assert.Equal(t, PDUType(0), pduType)
+	})
+
+	t.Run("cursor_at_end_of_buffer", func(t *testing.T) {
+		data := []byte{0x30, 0x10}
+		pduType, ok := peekV3PDUType(data, len(data), logger)
+		assert.False(t, ok, "should fail when cursor at end")
+		assert.Equal(t, PDUType(0), pduType)
+	})
+
+	t.Run("cursor_beyond_buffer", func(t *testing.T) {
+		data := []byte{0x30, 0x10}
+		pduType, ok := peekV3PDUType(data, len(data)+10, logger)
+		assert.False(t, ok, "should fail when cursor beyond buffer")
+		assert.Equal(t, PDUType(0), pduType)
+	})
+
+	t.Run("invalid_tag_not_SEQUENCE_or_OctetString", func(t *testing.T) {
+		data := []byte{0x02, 0x01, 0x00} // INTEGER tag
+		pduType, ok := peekV3PDUType(data, 0, logger)
+		assert.False(t, ok, "should fail for invalid tag")
+		assert.Equal(t, PDUType(0), pduType)
+	})
+
+	t.Run("truncated_contextEngineID", func(t *testing.T) {
+		// SEQUENCE with length but truncated before contextEngineID
+		data := []byte{0x30, 0x20} // claims 32 bytes but only 2
+		pduType, ok := peekV3PDUType(data, 0, logger)
+		assert.False(t, ok, "should fail for truncated contextEngineID")
+		assert.Equal(t, PDUType(0), pduType)
+	})
+
+	t.Run("truncated_contextName", func(t *testing.T) {
+		// SEQUENCE + contextEngineID but truncated before contextName
+		data := []byte{
+			0x30, 0x20, // SEQUENCE
+			0x04, 0x05, 't', 'e', 's', 't', '1', // contextEngineID
+			// no contextName follows
+		}
+		pduType, ok := peekV3PDUType(data, 0, logger)
+		assert.False(t, ok, "should fail for truncated contextName")
+		assert.Equal(t, PDUType(0), pduType)
+	})
+
+	t.Run("truncated_before_PDU_tag", func(t *testing.T) {
+		// SEQUENCE + contextEngineID + contextName but no PDU tag
+		data := []byte{
+			0x30, 0x0d, // SEQUENCE (length covers content exactly)
+			0x04, 0x05, 't', 'e', 's', 't', '1', // contextEngineID
+			0x04, 0x04, 't', 'e', 's', 't', // contextName
+			// no PDU tag follows
+		}
+		pduType, ok := peekV3PDUType(data, 0, logger)
+		assert.False(t, ok, "should fail when truncated before PDU tag")
+		assert.Equal(t, PDUType(0), pduType)
+	})
+
+	t.Run("empty_buffer", func(t *testing.T) {
+		pduType, ok := peekV3PDUType([]byte{}, 0, logger)
+		assert.False(t, ok, "should fail for empty buffer")
+		assert.Equal(t, PDUType(0), pduType)
+	})
+
+	t.Run("with_nonzero_cursor_offset", func(t *testing.T) {
+		// Prepend some garbage, then a valid ScopedPDU at offset 5
+		prefix := []byte{0xff, 0xff, 0xff, 0xff, 0xff}
+		scopedPDU := buildScopedPDU(Report)
+		data := append(prefix, scopedPDU...)
+
+		pduType, ok := peekV3PDUType(data, 5, logger)
+		assert.True(t, ok, "should peek from correct offset")
+		assert.Equal(t, Report, pduType)
+	})
+}
+
+func TestHandleReportPDU(t *testing.T) {
+	makeGoSNMP := func() *GoSNMP {
+		return &GoSNMP{
+			Version: Version3,
+			Logger:  NewLogger(log.New(io.Discard, "", 0)),
+			SecurityParameters: &UsmSecurityParameters{
+				UserName:                 "testuser",
+				AuthoritativeEngineID:    "testengine",
+				AuthoritativeEngineBoots: 1,
+				AuthoritativeEngineTime:  1000,
+			},
+		}
+	}
+
+	makeReportPacket := func(oid string, counterValue uint32) *SnmpPacket {
+		return &SnmpPacket{
+			Version: Version3,
+			PDUType: Report,
+			Variables: []SnmpPDU{
+				{
+					Name:  oid,
+					Type:  Counter32,
+					Value: counterValue,
+				},
+			},
+			SecurityParameters: &UsmSecurityParameters{
+				AuthoritativeEngineID:    "reportengine",
+				AuthoritativeEngineBoots: 2,
+				AuthoritativeEngineTime:  2000,
+			},
+		}
+	}
+
+	tests := []struct {
+		name          string
+		oid           string
+		alreadyResent bool
+		wantOutcome   responseOutcome
+		wantErr       error
+	}{
+		{
+			name:          "usmStatsNotInTimeWindows_first_attempt",
+			oid:           usmStatsNotInTimeWindows,
+			alreadyResent: false,
+			wantOutcome:   outcomeResend,
+			wantErr:       ErrNotInTimeWindow,
+		},
+		{
+			name:          "usmStatsNotInTimeWindows_already_resent",
+			oid:           usmStatsNotInTimeWindows,
+			alreadyResent: true,
+			wantOutcome:   outcomeFatal,
+			wantErr:       ErrNotInTimeWindow,
+		},
+		{
+			name:          "usmStatsUnknownEngineIDs",
+			oid:           usmStatsUnknownEngineIDs,
+			alreadyResent: false,
+			wantOutcome:   outcomeSuccess,
+			wantErr:       nil,
+		},
+		{
+			name:          "usmStatsWrongDigests",
+			oid:           usmStatsWrongDigests,
+			alreadyResent: false,
+			wantOutcome:   outcomeFatal,
+			wantErr:       ErrWrongDigest,
+		},
+		{
+			name:          "usmStatsUnsupportedSecLevels",
+			oid:           usmStatsUnsupportedSecLevels,
+			alreadyResent: false,
+			wantOutcome:   outcomeFatal,
+			wantErr:       ErrUnknownSecurityLevel,
+		},
+		{
+			name:          "usmStatsUnknownUserNames",
+			oid:           usmStatsUnknownUserNames,
+			alreadyResent: false,
+			wantOutcome:   outcomeFatal,
+			wantErr:       ErrUnknownUsername,
+		},
+		{
+			name:          "usmStatsDecryptionErrors",
+			oid:           usmStatsDecryptionErrors,
+			alreadyResent: false,
+			wantOutcome:   outcomeFatal,
+			wantErr:       ErrDecryption,
+		},
+		{
+			name:          "snmpUnknownSecurityModels",
+			oid:           snmpUnknownSecurityModels,
+			alreadyResent: false,
+			wantOutcome:   outcomeFatal,
+			wantErr:       ErrUnknownSecurityModels,
+		},
+		{
+			name:          "snmpInvalidMsgs",
+			oid:           snmpInvalidMsgs,
+			alreadyResent: false,
+			wantOutcome:   outcomeFatal,
+			wantErr:       ErrInvalidMsgs,
+		},
+		{
+			name:          "snmpUnknownPDUHandlers",
+			oid:           snmpUnknownPDUHandlers,
+			alreadyResent: false,
+			wantOutcome:   outcomeFatal,
+			wantErr:       ErrUnknownPDUHandlers,
+		},
+		{
+			name:          "unknown_OID",
+			oid:           ".1.3.6.1.99.99.99.99",
+			alreadyResent: false,
+			wantOutcome:   outcomeFatal,
+			wantErr:       ErrUnknownReportPDU,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := makeGoSNMP()
+			result := makeReportPacket(tt.oid, 1)
+			packetOut := &SnmpPacket{
+				Version:            Version3,
+				PDUType:            GetRequest,
+				SecurityParameters: g.SecurityParameters.Copy(),
+			}
+
+			gotResult, gotOutcome, gotErr := g.handleReportPDU(result, packetOut, tt.alreadyResent)
+
+			assert.Equal(t, tt.wantOutcome, gotOutcome, "outcome mismatch")
+			assert.NotNil(t, gotResult, "result should not be nil")
+
+			if tt.wantErr == nil {
+				assert.NoError(t, gotErr, "expected no error")
+			} else {
+				assert.ErrorIs(t, gotErr, tt.wantErr, "error mismatch")
+			}
+		})
+	}
+
+	t.Run("malformed_REPORT_no_variables", func(t *testing.T) {
+		g := makeGoSNMP()
+		result := &SnmpPacket{
+			Version:   Version3,
+			PDUType:   Report,
+			Variables: []SnmpPDU{}, // empty
+			SecurityParameters: &UsmSecurityParameters{
+				AuthoritativeEngineID: "reportengine",
+			},
+		}
+		packetOut := &SnmpPacket{
+			Version:            Version3,
+			PDUType:            GetRequest,
+			SecurityParameters: g.SecurityParameters.Copy(),
+		}
+
+		gotResult, gotOutcome, gotErr := g.handleReportPDU(result, packetOut, false)
+
+		assert.Equal(t, outcomeFatal, gotOutcome, "malformed REPORT should be fatal")
+		assert.NotNil(t, gotResult, "result should not be nil")
+		assert.Error(t, gotErr, "expected error for malformed REPORT")
+		assert.Contains(t, gotErr.Error(), "malformed REPORT")
+	})
+
+	t.Run("stores_security_parameters", func(t *testing.T) {
+		// Simulate discovery scenario where engine ID is initially empty.
+		// This is the only case where we accept new engine IDs from REPORTs.
+		g := makeGoSNMP()
+		g.SecurityParameters.(*UsmSecurityParameters).AuthoritativeEngineID = "" // discovery state
+
+		result := makeReportPacket(usmStatsUnknownEngineIDs, 1)
+		resultUSP := result.SecurityParameters.(*UsmSecurityParameters)
+		resultUSP.AuthoritativeEngineID = "newengine123"
+		resultUSP.AuthoritativeEngineBoots = 42
+		resultUSP.AuthoritativeEngineTime = 99999
+
+		packetOut := &SnmpPacket{
+			Version:            Version3,
+			PDUType:            GetRequest,
+			SecurityParameters: g.SecurityParameters.Copy(),
+		}
+
+		_, _, _ = g.handleReportPDU(result, packetOut, false)
+
+		gUSP := g.SecurityParameters.(*UsmSecurityParameters)
+		assert.Equal(t, "newengine123", gUSP.AuthoritativeEngineID)
+		assert.Equal(t, uint32(42), gUSP.AuthoritativeEngineBoots)
+		assert.Equal(t, uint32(99999), gUSP.AuthoritativeEngineTime)
+	})
+
+	t.Run("does_not_store_security_parameters_on_engineID_mismatch", func(t *testing.T) {
+		g := makeGoSNMP()
+		g.SecurityParameters.(*UsmSecurityParameters).AuthoritativeEngineID = "engine1"
+
+		result := makeReportPacket(usmStatsNotInTimeWindows, 1)
+		result.SecurityParameters.(*UsmSecurityParameters).AuthoritativeEngineID = "engine2" // mismatch
+
+		packetOut := &SnmpPacket{
+			Version:            Version3,
+			PDUType:            GetRequest,
+			SecurityParameters: g.SecurityParameters.Copy(),
+		}
+
+		_, _, _ = g.handleReportPDU(result, packetOut, false)
+
+		gUSP := g.SecurityParameters.(*UsmSecurityParameters)
+		assert.Equal(t, "engine1", gUSP.AuthoritativeEngineID, "EngineID should not be updated")
+	})
+
+	t.Run("notInTimeWindows_updates_packetOut", func(t *testing.T) {
+		g := makeGoSNMP()
+		result := makeReportPacket(usmStatsNotInTimeWindows, 1)
+		resultUSP := result.SecurityParameters.(*UsmSecurityParameters)
+		resultUSP.AuthoritativeEngineTime = 55555
+		// a bit of a hack to make the engine IDs match for this test
+		resultUSP.AuthoritativeEngineID = g.SecurityParameters.getDefaultContextEngineID()
+
+		packetOut := &SnmpPacket{
+			Version:            Version3,
+			PDUType:            GetRequest,
+			SecurityParameters: g.SecurityParameters.Copy(),
+		}
+		_, outcome, _ := g.handleReportPDU(result, packetOut, false)
+
+		assert.Equal(t, outcomeResend, outcome)
+		pktUSP := packetOut.SecurityParameters.(*UsmSecurityParameters)
+		assert.Equal(t, uint32(55555), pktUSP.AuthoritativeEngineTime)
+	})
+
+	t.Run("unauthenticated_cannot_overwrite_authenticated_time", func(t *testing.T) {
+		// Once authenticated time values are established, unauthenticated REPORTs
+		// should not be able to overwrite them (RFC 3414 §3.2 step 7).
+		g := makeGoSNMP()
+		gUSP := g.SecurityParameters.(*UsmSecurityParameters)
+		gUSP.AuthoritativeEngineID = "" // discovery state
+		gUSP.AuthoritativeEngineBoots = 0
+		gUSP.AuthoritativeEngineTime = 0
+
+		// First: simulate receiving authenticated response (sets authenticatedTimeValues=true)
+		authResult := &SnmpPacket{
+			Version:       Version3,
+			PDUType:       GetResponse,
+			authenticated: true, // simulates passing auth check
+			SecurityParameters: &UsmSecurityParameters{
+				AuthoritativeEngineID:    "engine1",
+				AuthoritativeEngineBoots: 10,
+				AuthoritativeEngineTime:  50000,
+				authenticated:            true,
+			},
+		}
+		_ = g.storeSecurityParameters(authResult)
+
+		// Verify authenticated values were stored
+		assert.Equal(t, uint32(10), gUSP.AuthoritativeEngineBoots)
+		assert.Equal(t, uint32(50000), gUSP.AuthoritativeEngineTime)
+		assert.True(t, gUSP.authenticatedTimeValues)
+
+		// Second: try to overwrite with unauthenticated REPORT
+		unauthResult := &SnmpPacket{
+			Version:       Version3,
+			PDUType:       Report,
+			authenticated: false, // unauthenticated
+			SecurityParameters: &UsmSecurityParameters{
+				AuthoritativeEngineID:    "engine1", // same engine
+				AuthoritativeEngineBoots: 99,
+				AuthoritativeEngineTime:  99999,
+				authenticated:            false,
+			},
+		}
+		_ = g.storeSecurityParameters(unauthResult)
+
+		// Verify unauthenticated values did NOT overwrite
+		assert.Equal(t, uint32(10), gUSP.AuthoritativeEngineBoots, "unauthenticated should not overwrite boots")
+		assert.Equal(t, uint32(50000), gUSP.AuthoritativeEngineTime, "unauthenticated should not overwrite time")
+	})
+
+	t.Run("authenticated_can_overwrite_authenticated_time", func(t *testing.T) {
+		// Authenticated values can always update, even if previous values were authenticated.
+		g := makeGoSNMP()
+		gUSP := g.SecurityParameters.(*UsmSecurityParameters)
+		gUSP.AuthoritativeEngineID = "engine1"
+		gUSP.AuthoritativeEngineBoots = 10
+		gUSP.AuthoritativeEngineTime = 50000
+		gUSP.authenticatedTimeValues = true
+
+		// Update with new authenticated values
+		authResult := &SnmpPacket{
+			Version:       Version3,
+			PDUType:       GetResponse,
+			authenticated: true,
+			SecurityParameters: &UsmSecurityParameters{
+				AuthoritativeEngineID:    "engine1",
+				AuthoritativeEngineBoots: 11,
+				AuthoritativeEngineTime:  60000,
+				authenticated:            true,
+			},
+		}
+		_ = g.storeSecurityParameters(authResult)
+
+		// Verify authenticated values were updated
+		assert.Equal(t, uint32(11), gUSP.AuthoritativeEngineBoots)
+		assert.Equal(t, uint32(60000), gUSP.AuthoritativeEngineTime)
+	})
+}
+
+func TestResponseOutcomeValues(t *testing.T) {
+	outcomes := []responseOutcome{outcomeSuccess, outcomeResend, outcomeContinueWait, outcomeRetry, outcomeFatal}
+	seen := make(map[responseOutcome]bool)
+	for _, o := range outcomes {
+		assert.False(t, seen[o], "duplicate outcome value: %d", o)
+		seen[o] = true
 	}
 }

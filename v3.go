@@ -199,6 +199,12 @@ func (x *GoSNMP) storeSecurityParameters(result *SnmpPacket) error {
 		x.ContextEngineID = result.SecurityParameters.getDefaultContextEngineID()
 	}
 
+	// Copy the packet's authenticated flag to the security parameters so that
+	// setSecurityParameters can gate time value updates appropriately.
+	if usp, ok := result.SecurityParameters.(*UsmSecurityParameters); ok {
+		usp.authenticated = result.authenticated
+	}
+
 	return x.SecurityParameters.setSecurityParameters(result.SecurityParameters)
 }
 
