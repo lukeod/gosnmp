@@ -289,6 +289,32 @@ func marshalBase128Int(out io.ByteWriter, n int64) (err error) {
 	return nil
 }
 
+// appendBase128Int appends the base-128 encoding of n to dst and returns the
+// extended slice. This is more efficient than marshalBase128Int for building
+// OID byte sequences as it avoids io.ByteWriter interface overhead.
+func appendBase128Int(dst []byte, n int64) []byte {
+	if n == 0 {
+		return append(dst, 0)
+	}
+
+	// Count how many 7-bit groups we need
+	l := 0
+	for i := n; i > 0; i >>= 7 {
+		l++
+	}
+
+	// Encode from most significant to least significant 7-bit group
+	for i := l - 1; i >= 0; i-- {
+		o := byte(n>>uint(i*7)) & 0x7f
+		if i != 0 {
+			o |= 0x80 // continuation bit
+		}
+		dst = append(dst, o)
+	}
+
+	return dst
+}
+
 /*
 	snmp Integer32 and INTEGER:
 	-2^31 and 2^31-1 inclusive (-2147483648 to 2147483647 decimal)
@@ -443,10 +469,11 @@ func marshalLength(length int) ([]byte, error) {
 }
 
 func marshalObjectIdentifier(oid string) ([]byte, error) {
-	out := new(bytes.Buffer)
 	oidLength := len(oid)
+	// Pre-allocate output slice. Output is typically smaller than input string
+	// since numeric strings compress to base-128 bytes.
+	out := make([]byte, 0, oidLength)
 	oidBase := 0
-	var err error
 	i := 0
 	for j := 0; j < oidLength; {
 		if oid[j] == '.' {
@@ -457,7 +484,7 @@ func marshalObjectIdentifier(oid string) ([]byte, error) {
 		for j < oidLength && oid[j] != '.' {
 			ch := int64(oid[j] - '0')
 			if ch > 9 {
-				return []byte{}, fmt.Errorf("unable to marshal OID: Invalid object identifier")
+				return nil, fmt.Errorf("unable to marshal OID: Invalid object identifier")
 			}
 			val *= 10
 			val += ch
@@ -466,35 +493,28 @@ func marshalObjectIdentifier(oid string) ([]byte, error) {
 		switch i {
 		case 0:
 			if val > 6 {
-				return []byte{}, fmt.Errorf("unable to marshal OID: Invalid object identifier")
+				return nil, fmt.Errorf("unable to marshal OID: Invalid object identifier")
 			}
 			oidBase = int(val * 40)
 		case 1:
 			if val >= 40 {
-				return []byte{}, fmt.Errorf("unable to marshal OID: Invalid object identifier")
+				return nil, fmt.Errorf("unable to marshal OID: Invalid object identifier")
 			}
 			oidBase += int(val)
-			err = out.WriteByte(byte(oidBase))
-			if err != nil {
-				return []byte{}, fmt.Errorf("unable to marshal OID: Invalid object identifier")
-			}
-
+			out = append(out, byte(oidBase))
 		default:
 			if val > MaxObjectSubIdentifierValue {
-				return []byte{}, fmt.Errorf("unable to marshal OID: Value out of range")
+				return nil, fmt.Errorf("unable to marshal OID: Value out of range")
 			}
-			err = marshalBase128Int(out, val)
-			if err != nil {
-				return []byte{}, fmt.Errorf("unable to marshal OID: Invalid object identifier")
-			}
+			out = appendBase128Int(out, val)
 		}
 		i++
 	}
 	if i < 2 || i > 128 {
-		return []byte{}, fmt.Errorf("unable to marshal OID: Invalid object identifier")
+		return nil, fmt.Errorf("unable to marshal OID: Invalid object identifier")
 	}
 
-	return out.Bytes(), nil
+	return out, nil
 }
 
 // TODO no tests

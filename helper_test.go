@@ -297,6 +297,26 @@ func BenchmarkMarshalObjectIdentifier(b *testing.B) {
 	}
 }
 
+func BenchmarkMarshalObjectIdentifierSizes(b *testing.B) {
+	benchmarks := []struct {
+		name string
+		oid  string
+	}{
+		{"Short_sysDescr", ".1.3.6.1.2.1.1.1"},
+		{"Medium_ifDescr", ".1.3.6.1.2.1.2.2.1.2.10001"},
+		{"Enterprise", ".1.3.6.1.4.1.9.9.109.1.1.1.1.3"},
+		{"LargeValues", ".1.3.6.1.4.1.4294967295.1.2.3"},
+		{"Long_50chars", ".1.3.6.1.4.1.12345.67890.11111.22222.33333.44444"},
+	}
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				marshalObjectIdentifier(bm.oid)
+			}
+		})
+	}
+}
+
 type testsMarshalUint32T struct {
 	value     uint32
 	goodBytes []byte
