@@ -269,7 +269,9 @@ sendRetry:
 		if x.PreSend != nil {
 			x.PreSend(x)
 		}
-		x.Logger.Printf("SENDING PACKET: %s", packetOut.SafeString())
+		if x.Logger.Enabled() {
+			x.Logger.Printf("SENDING PACKET: %s", packetOut.SafeString())
+		}
 		// If using UDP and unconnected socket, send packet directly to stored address.
 		if uconn, ok := x.Conn.(net.PacketConn); ok && x.uaddr != nil {
 			_, err = uconn.WriteTo(outBuf, x.uaddr)
@@ -465,7 +467,9 @@ func (x *GoSNMP) send(packetOut *SnmpPacket, wait bool) (result *SnmpPacket, err
 	}
 
 	if result.Version == Version3 {
-		x.Logger.Printf("SEND STORE SECURITY PARAMS from result: %s", result.SecurityParameters.SafeString())
+		if x.Logger.Enabled() {
+			x.Logger.Printf("SEND STORE SECURITY PARAMS from result: %s", result.SecurityParameters.SafeString())
+		}
 		err = x.storeSecurityParameters(result)
 
 		if result.PDUType == Report && len(result.Variables) == 1 {

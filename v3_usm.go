@@ -235,6 +235,9 @@ func (sp *UsmSecurityParameters) SafeString() string {
 
 // Log logs security paramater information to the provided GoSNMP Logger
 func (sp *UsmSecurityParameters) Log() {
+	if !sp.Logger.Enabled() {
+		return
+	}
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 	sp.Logger.Printf("SECURITY PARAMETERS:%s", sp.SafeString())

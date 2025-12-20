@@ -17,3 +17,9 @@ func (l *Logger) Printf(format string, v ...any) {
 		l.logger.Printf(format, v...)
 	}
 }
+
+// Enabled returns true if logging is enabled (i.e., a logger has been set).
+// Use this to guard expensive log argument evaluation.
+func (l *Logger) Enabled() bool {
+	return l.logger != nil
+}
