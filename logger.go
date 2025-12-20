@@ -14,3 +14,8 @@ func (l *Logger) Print(v ...interface{}) {
 
 func (l *Logger) Printf(format string, v ...interface{}) {
 }
+
+// Enabled returns false when built with gosnmp_nodebug tag.
+func (l *Logger) Enabled() bool {
+	return false
+}

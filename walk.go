@@ -69,66 +69,106 @@ RequestLoop:
 
 		switch response.Error {
 		case TooBig:
-			x.Logger.Print("Walk terminated with TooBig")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with TooBig")
+			}
 			break RequestLoop
 		case NoSuchName:
-			x.Logger.Print("Walk terminated with NoSuchName")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with NoSuchName")
+			}
 			break RequestLoop
 		case BadValue:
-			x.Logger.Print("Walk terminated with BadValue")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with BadValue")
+			}
 			break RequestLoop
 		case ReadOnly:
-			x.Logger.Print("Walk terminated with ReadOnly")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with ReadOnly")
+			}
 			break RequestLoop
 		case GenErr:
-			x.Logger.Print("Walk terminated with GenErr")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with GenErr")
+			}
 			break RequestLoop
 		case NoAccess:
-			x.Logger.Print("Walk terminated with NoAccess")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with NoAccess")
+			}
 			break RequestLoop
 		case WrongType:
-			x.Logger.Print("Walk terminated with WrongType")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with WrongType")
+			}
 			break RequestLoop
 		case WrongLength:
-			x.Logger.Print("Walk terminated with WrongLength")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with WrongLength")
+			}
 			break RequestLoop
 		case WrongEncoding:
-			x.Logger.Print("Walk terminated with WrongEncoding")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with WrongEncoding")
+			}
 			break RequestLoop
 		case WrongValue:
-			x.Logger.Print("Walk terminated with WrongValue")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with WrongValue")
+			}
 			break RequestLoop
 		case NoCreation:
-			x.Logger.Print("Walk terminated with NoCreation")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with NoCreation")
+			}
 			break RequestLoop
 		case InconsistentValue:
-			x.Logger.Print("Walk terminated with InconsistentValue")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with InconsistentValue")
+			}
 			break RequestLoop
 		case ResourceUnavailable:
-			x.Logger.Print("Walk terminated with ResourceUnavailable")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with ResourceUnavailable")
+			}
 			break RequestLoop
 		case CommitFailed:
-			x.Logger.Print("Walk terminated with CommitFailed")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with CommitFailed")
+			}
 			break RequestLoop
 		case UndoFailed:
-			x.Logger.Print("Walk terminated with UndoFailed")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with UndoFailed")
+			}
 			break RequestLoop
 		case AuthorizationError:
-			x.Logger.Print("Walk terminated with AuthorizationError")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with AuthorizationError")
+			}
 			break RequestLoop
 		case NotWritable:
-			x.Logger.Print("Walk terminated with NotWritable")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with NotWritable")
+			}
 			break RequestLoop
 		case InconsistentName:
-			x.Logger.Print("Walk terminated with InconsistentName")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk terminated with InconsistentName")
+			}
 			break RequestLoop
 		case NoError:
-			x.Logger.Print("Walk completed with NoError")
+			if x.Logger.Enabled() {
+				x.Logger.Print("Walk completed with NoError")
+			}
 		}
 
 		for i, pdu := range response.Variables {
 			if pdu.Type == EndOfMibView || pdu.Type == NoSuchObject || pdu.Type == NoSuchInstance {
-				x.Logger.Printf("BulkWalk terminated with type 0x%x", pdu.Type)
+				if x.Logger.Enabled() {
+					x.Logger.Printf("BulkWalk terminated with type 0x%x", pdu.Type)
+				}
 				break RequestLoop
 			}
 			if !strings.HasPrefix(pdu.Name, rootOid+".") {
@@ -163,7 +203,9 @@ RequestLoop:
 		// Save last oid for next request
 		oid = response.Variables[len(response.Variables)-1].Name
 	}
-	x.Logger.Printf("BulkWalk completed in %d requests", requests)
+	if x.Logger.Enabled() {
+		x.Logger.Printf("BulkWalk completed in %d requests", requests)
+	}
 	return nil
 }
 

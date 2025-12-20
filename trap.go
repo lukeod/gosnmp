@@ -207,13 +207,17 @@ func (t *TrapListener) Close() {
 		}
 
 		if err := t.conn.Close(); err != nil {
-			t.Params.Logger.Printf("failed to Close() the TrapListener socket: %s", err)
+			if t.Params.Logger.Enabled() {
+				t.Params.Logger.Printf("failed to Close() the TrapListener socket: %s", err)
+			}
 		}
 
 		select {
 		case <-t.done:
 		case <-time.After(t.CloseTimeout): // A timeout can prevent blocking forever
-			t.Params.Logger.Printf("timeout while awaiting done signal on TrapListener Close()")
+			if t.Params.Logger.Enabled() {
+				t.Params.Logger.Printf("timeout while awaiting done signal on TrapListener Close()")
+			}
 		}
 	}
 }
@@ -233,7 +237,9 @@ func (t *TrapListener) SendUDP(packet *SnmpPacket, addr *net.UDPAddr) error {
 
 	// This isn't fatal, but should be logged.
 	if count != len(ob) {
-		t.Params.Logger.Printf("Failed to send all bytes of SnmpPacket!\n")
+		if t.Params.Logger.Enabled() {
+			t.Params.Logger.Printf("Failed to send all bytes of SnmpPacket!\n")
+		}
 	}
 	return nil
 }
@@ -269,24 +275,32 @@ func (t *TrapListener) listenUDP(addr string) error {
 					// err most likely comes from reading from a closed connection
 					continue
 				}
-				t.Params.Logger.Printf("TrapListener: error in read %s\n", err)
+				if t.Params.Logger.Enabled() {
+					t.Params.Logger.Printf("TrapListener: error in read %s\n", err)
+				}
 				continue
 			}
 
 			msg := buf[:rlen]
 			trap, err := t.Params.UnmarshalTrap(msg, false)
 			if err != nil {
-				t.Params.Logger.Printf("TrapListener: error in UnmarshalTrap %s\n", err)
+				if t.Params.Logger.Enabled() {
+					t.Params.Logger.Printf("TrapListener: error in UnmarshalTrap %s\n", err)
+				}
 				continue
 			}
 			if trap.Version == Version3 && trap.SecurityModel == UserSecurityModel && t.Params.SecurityModel == UserSecurityModel {
 				securityParams, ok := t.Params.SecurityParameters.(*UsmSecurityParameters)
 				if !ok {
-					t.Params.Logger.Printf("TrapListener: Invalid SecurityParameters types")
+					if t.Params.Logger.Enabled() {
+						t.Params.Logger.Printf("TrapListener: Invalid SecurityParameters types")
+					}
 				}
 				packetSecurityParams, ok := trap.SecurityParameters.(*UsmSecurityParameters)
 				if !ok {
-					t.Params.Logger.Printf("TrapListener: Invalid SecurityParameters types")
+					if t.Params.Logger.Enabled() {
+						t.Params.Logger.Printf("TrapListener: Invalid SecurityParameters types")
+					}
 				}
 				snmpEngineID := securityParams.AuthoritativeEngineID
 				msgAuthoritativeEngineID := packetSecurityParams.AuthoritativeEngineID
@@ -299,7 +313,9 @@ func (t *TrapListener) listenUDP(addr string) error {
 						atomic.AddUint32(&t.usmStatsUnknownEngineIDsCount, 1)
 						err := t.reportAuthoritativeEngineID(trap, snmpEngineID, remote)
 						if err != nil {
-							t.Params.Logger.Printf("TrapListener: %s\n", err)
+							if t.Params.Logger.Enabled() {
+								t.Params.Logger.Printf("TrapListener: %s\n", err)
+							}
 						}
 						continue
 					}
@@ -335,7 +351,9 @@ func (t *TrapListener) listenUDP(addr string) error {
 				// determine), so it's left to future implementations.
 				err := t.SendUDP(trap, remote)
 				if err != nil {
-					t.Params.Logger.Printf("TrapListener: %s\n", err)
+					if t.Params.Logger.Enabled() {
+						t.Params.Logger.Printf("TrapListener: %s\n", err)
+					}
 				}
 			}
 		}
@@ -368,14 +386,18 @@ func (t *TrapListener) handleTCPRequest(conn net.Conn) {
 	// Read the incoming connection into the buffer.
 	reqLen, err := conn.Read(buf)
 	if err != nil {
-		t.Params.Logger.Printf("TrapListener: error in read %s\n", err)
+		if t.Params.Logger.Enabled() {
+			t.Params.Logger.Printf("TrapListener: error in read %s\n", err)
+		}
 		return
 	}
 
 	msg := buf[:reqLen]
 	traps, err := t.Params.UnmarshalTrap(msg, false)
 	if err != nil {
-		t.Params.Logger.Printf("TrapListener: error in read %s\n", err)
+		if t.Params.Logger.Enabled() {
+			t.Params.Logger.Printf("TrapListener: error in read %s\n", err)
+		}
 		return
 	}
 	// TODO: lying for backward compatibility reason - create UDP Address ... not nice
@@ -459,7 +481,9 @@ func (t *TrapListener) Listen(addr string) error {
 
 // Default trap handler
 func (t *TrapListener) debugTrapHandler(s *SnmpPacket, u *net.UDPAddr) {
-	t.Params.Logger.Printf("got trapdata from %+v: %+v\n", u, s)
+	if t.Params.Logger.Enabled() {
+		t.Params.Logger.Printf("got trapdata from %+v: %+v\n", u, s)
+	}
 }
 
 // UnmarshalTrap unpacks the SNMP Trap.
@@ -467,7 +491,9 @@ func (x *GoSNMP) UnmarshalTrap(trap []byte, useResponseSecurityParameters bool) 
 	// Get only the version from the header of the trap
 	version, _, err := x.unmarshalVersionFromHeader(trap, new(SnmpPacket))
 	if err != nil {
-		x.Logger.Printf("UnmarshalTrap version unmarshal: %s\n", err)
+		if x.Logger.Enabled() {
+			x.Logger.Printf("UnmarshalTrap version unmarshal: %s\n", err)
+		}
 		return nil, err
 	}
 	// If there are multiple users configured and the SNMP trap is v3, see which user has valid credentials
@@ -475,12 +501,16 @@ func (x *GoSNMP) UnmarshalTrap(trap []byte, useResponseSecurityParameters bool) 
 	if x.TrapSecurityParametersTable != nil && version == Version3 {
 		identifier, err := x.getTrapIdentifier(trap)
 		if err != nil {
-			x.Logger.Printf("UnmarshalTrap V3 get trap identifier: %s\n", err)
+			if x.Logger.Enabled() {
+				x.Logger.Printf("UnmarshalTrap V3 get trap identifier: %s\n", err)
+			}
 			return nil, err
 		}
 		secParamsList, err := x.TrapSecurityParametersTable.Get(identifier)
 		if err != nil {
-			x.Logger.Printf("UnmarshalTrap V3 get security parameters from table: %s\n", err)
+			if x.Logger.Enabled() {
+				x.Logger.Printf("UnmarshalTrap V3 get security parameters from table: %s\n", err)
+			}
 			return nil, err
 		}
 		for _, secParams := range secParamsList {
@@ -522,7 +552,9 @@ func (x *GoSNMP) unmarshalTrapBase(trap []byte, sp SnmpV3SecurityParameters, use
 
 	cursor, err := x.unmarshalHeader(trap, result)
 	if err != nil {
-		x.Logger.Printf("UnmarshalTrap: %s\n", err)
+		if x.Logger.Enabled() {
+			x.Logger.Printf("UnmarshalTrap: %s\n", err)
+		}
 		return nil, err
 	}
 
@@ -530,20 +562,26 @@ func (x *GoSNMP) unmarshalTrapBase(trap []byte, sp SnmpV3SecurityParameters, use
 		if result.SecurityModel == UserSecurityModel {
 			err = x.testAuthentication(trap, result, useResponseSecurityParameters)
 			if err != nil {
-				x.Logger.Printf("UnmarshalTrap v3 auth: %s\n", err)
+				if x.Logger.Enabled() {
+					x.Logger.Printf("UnmarshalTrap v3 auth: %s\n", err)
+				}
 				return nil, err
 			}
 		}
 
 		trap, cursor, err = x.decryptPacket(trap, cursor, result)
 		if err != nil {
-			x.Logger.Printf("UnmarshalTrap v3 decrypt: %s\n", err)
+			if x.Logger.Enabled() {
+				x.Logger.Printf("UnmarshalTrap v3 decrypt: %s\n", err)
+			}
 			return nil, err
 		}
 	}
 	err = x.unmarshalPayload(trap, cursor, result)
 	if err != nil {
-		x.Logger.Printf("UnmarshalTrap: %s\n", err)
+		if x.Logger.Enabled() {
+			x.Logger.Printf("UnmarshalTrap: %s\n", err)
+		}
 		return nil, err
 	}
 	return result, nil
