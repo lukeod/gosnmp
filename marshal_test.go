@@ -9,6 +9,7 @@ package gosnmp
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -2256,4 +2257,335 @@ func TestMarshalTLV(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHandleReportPDU_NotInTimeWindows(t *testing.T) {
+	// Test that handleReportPDU correctly handles usmStatsNotInTimeWindows REPORT:
+	// - Returns outcomeResend on first occurrence
+	// - Updates packetOut's security parameters with new engine time
+	// - Returns outcomeFatal if already resent once
+
+	const (
+		engineTimeOld = uint32(207512)
+		engineTimeNew = uint32(1094073)
+		engineBoots   = uint32(1)
+	)
+	engineID := string([]byte{0x80, 0x00, 0x1f, 0x88, 0x80})
+
+	t.Run("first_report_triggers_resend", func(t *testing.T) {
+		x := &GoSNMP{
+			Version:       Version3,
+			SecurityModel: UserSecurityModel,
+			SecurityParameters: &UsmSecurityParameters{
+				UserName:                 "testuser",
+				AuthoritativeEngineID:    engineID,
+				AuthoritativeEngineBoots: engineBoots,
+				AuthoritativeEngineTime:  engineTimeOld,
+			},
+			Logger: NewLogger(log.New(io.Discard, "", 0)),
+		}
+
+		// Simulate REPORT PDU from agent with new engine time
+		reportResult := &SnmpPacket{
+			Version:       Version3,
+			PDUType:       Report,
+			SecurityModel: UserSecurityModel,
+			SecurityParameters: &UsmSecurityParameters{
+				AuthoritativeEngineID:    engineID,
+				AuthoritativeEngineBoots: engineBoots,
+				AuthoritativeEngineTime:  engineTimeNew,
+				UserName:                 "testuser",
+			},
+			Variables: []SnmpPDU{
+				{Name: usmStatsNotInTimeWindows, Type: Counter32, Value: uint32(1)},
+			},
+		}
+
+		// The outgoing packet that will be resent
+		packetOut := &SnmpPacket{
+			Version:       Version3,
+			SecurityModel: UserSecurityModel,
+			SecurityParameters: &UsmSecurityParameters{
+				AuthoritativeEngineID:    engineID,
+				AuthoritativeEngineBoots: engineBoots,
+				AuthoritativeEngineTime:  engineTimeOld,
+				UserName:                 "testuser",
+			},
+		}
+
+		_, outcome, err := x.handleReportPDU(reportResult, packetOut, false)
+
+		// Verify outcome is resend
+		if outcome != outcomeResend {
+			t.Errorf("expected outcomeResend, got %v", outcome)
+		}
+
+		// Verify error is ErrNotInTimeWindow (informational, not fatal)
+		if !errors.Is(err, ErrNotInTimeWindow) {
+			t.Errorf("expected ErrNotInTimeWindow, got %v", err)
+		}
+
+		// Verify connection's security parameters were updated
+		connSP := x.SecurityParameters.(*UsmSecurityParameters)
+		if connSP.AuthoritativeEngineTime != engineTimeNew {
+			t.Errorf("connection engineTime not updated: got %d, want %d",
+				connSP.AuthoritativeEngineTime, engineTimeNew)
+		}
+
+		// Verify packetOut's security parameters were updated for resend
+		pktSP := packetOut.SecurityParameters.(*UsmSecurityParameters)
+		if pktSP.AuthoritativeEngineTime != engineTimeNew {
+			t.Errorf("packetOut engineTime not updated: got %d, want %d",
+				pktSP.AuthoritativeEngineTime, engineTimeNew)
+		}
+	})
+
+	t.Run("second_report_is_fatal", func(t *testing.T) {
+		x := &GoSNMP{
+			Version:       Version3,
+			SecurityModel: UserSecurityModel,
+			SecurityParameters: &UsmSecurityParameters{
+				UserName:                 "testuser",
+				AuthoritativeEngineID:    engineID,
+				AuthoritativeEngineBoots: engineBoots,
+				AuthoritativeEngineTime:  engineTimeNew,
+			},
+			Logger: NewLogger(log.New(io.Discard, "", 0)),
+		}
+
+		reportResult := &SnmpPacket{
+			Version:       Version3,
+			PDUType:       Report,
+			SecurityModel: UserSecurityModel,
+			SecurityParameters: &UsmSecurityParameters{
+				AuthoritativeEngineID:    engineID,
+				AuthoritativeEngineBoots: engineBoots,
+				AuthoritativeEngineTime:  engineTimeNew + 100,
+				UserName:                 "testuser",
+			},
+			Variables: []SnmpPDU{
+				{Name: usmStatsNotInTimeWindows, Type: Counter32, Value: uint32(2)},
+			},
+		}
+
+		packetOut := &SnmpPacket{
+			Version:       Version3,
+			SecurityModel: UserSecurityModel,
+			SecurityParameters: &UsmSecurityParameters{
+				AuthoritativeEngineID:    engineID,
+				AuthoritativeEngineBoots: engineBoots,
+				AuthoritativeEngineTime:  engineTimeNew,
+				UserName:                 "testuser",
+			},
+		}
+
+		// alreadyResent=true simulates that we already tried once
+		_, outcome, err := x.handleReportPDU(reportResult, packetOut, true)
+
+		if outcome != outcomeFatal {
+			t.Errorf("expected outcomeFatal on second report, got %v", outcome)
+		}
+		if !errors.Is(err, ErrNotInTimeWindow) {
+			t.Errorf("expected ErrNotInTimeWindow, got %v", err)
+		}
+	})
+
+	t.Run("malformed_report_no_variables", func(t *testing.T) {
+		x := &GoSNMP{
+			Version:       Version3,
+			SecurityModel: UserSecurityModel,
+			SecurityParameters: &UsmSecurityParameters{
+				UserName:              "testuser",
+				AuthoritativeEngineID: engineID,
+			},
+			Logger: NewLogger(log.New(io.Discard, "", 0)),
+		}
+
+		reportResult := &SnmpPacket{
+			Version:            Version3,
+			PDUType:            Report,
+			SecurityModel:      UserSecurityModel,
+			SecurityParameters: &UsmSecurityParameters{AuthoritativeEngineID: engineID},
+			Variables:          []SnmpPDU{}, // Empty - malformed
+		}
+
+		packetOut := &SnmpPacket{
+			Version:            Version3,
+			SecurityModel:      UserSecurityModel,
+			SecurityParameters: &UsmSecurityParameters{},
+		}
+
+		_, outcome, err := x.handleReportPDU(reportResult, packetOut, false)
+
+		if outcome != outcomeFatal {
+			t.Errorf("expected outcomeFatal for malformed report, got %v", outcome)
+		}
+		if err == nil || !strings.Contains(err.Error(), "malformed") {
+			t.Errorf("expected malformed error, got %v", err)
+		}
+	})
+}
+
+func TestSNMPv3_FatalReportErrors(t *testing.T) {
+	// Test that fatal REPORT PDUs return the correct error and don't trigger retries.
+	// These are errors where retrying won't help (wrong credentials, unsupported features).
+
+	tests := []struct {
+		name        string
+		reportOID   string // OID to include in REPORT varbind
+		expectedErr error
+	}{
+		{
+			name:        "usmStatsWrongDigests",
+			reportOID:   usmStatsWrongDigests,
+			expectedErr: ErrWrongDigest,
+		},
+		{
+			name:        "usmStatsUnsupportedSecLevels",
+			reportOID:   usmStatsUnsupportedSecLevels,
+			expectedErr: ErrUnknownSecurityLevel,
+		},
+		{
+			name:        "usmStatsUnknownUserNames",
+			reportOID:   usmStatsUnknownUserNames,
+			expectedErr: ErrUnknownUsername,
+		},
+		{
+			name:        "usmStatsDecryptionErrors",
+			reportOID:   usmStatsDecryptionErrors,
+			expectedErr: ErrDecryption,
+		},
+		{
+			name:        "snmpUnknownSecurityModels",
+			reportOID:   snmpUnknownSecurityModels,
+			expectedErr: ErrUnknownSecurityModels,
+		},
+		{
+			name:        "snmpInvalidMsgs",
+			reportOID:   snmpInvalidMsgs,
+			expectedErr: ErrInvalidMsgs,
+		},
+		{
+			name:        "snmpUnknownPDUHandlers",
+			reportOID:   snmpUnknownPDUHandlers,
+			expectedErr: ErrUnknownPDUHandlers,
+		},
+		{
+			name:        "unknownReportOID",
+			reportOID:   ".1.3.6.1.6.3.15.1.1.99.0", // not a real USM stat
+			expectedErr: ErrUnknownReportPDU,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Build a minimal SNMPv3 REPORT PDU with NoAuthNoPriv
+			reportPDU := buildTestReportPDU(t, tc.reportOID)
+
+			srvr, err := net.ListenUDP("udp4", &net.UDPAddr{})
+			if err != nil {
+				t.Fatalf("listen error: %s", err)
+			}
+			defer srvr.Close()
+
+			// Count requests received
+			requestCount := 0
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				buf := make([]byte, 8192)
+				for {
+					_ = srvr.SetReadDeadline(time.Now().Add(2 * time.Second))
+					n, addr, readErr := srvr.ReadFromUDP(buf)
+					if readErr != nil {
+						return
+					}
+					requestCount++
+					// Always reply with the REPORT
+					_, _ = srvr.WriteToUDP(reportPDU, addr)
+					_ = n // silence unused warning
+				}
+			}()
+
+			x := &GoSNMP{
+				Target:        srvr.LocalAddr().(*net.UDPAddr).IP.String(),
+				Port:          uint16(srvr.LocalAddr().(*net.UDPAddr).Port),
+				Version:       Version3,
+				Timeout:       500 * time.Millisecond,
+				Retries:       2, // Would retry if error was retriable
+				MsgFlags:      NoAuthNoPriv,
+				SecurityModel: UserSecurityModel,
+				SecurityParameters: &UsmSecurityParameters{
+					UserName:                 "testuser",
+					AuthoritativeEngineID:    string([]byte{0x80, 0x00, 0x1f, 0x88, 0x80}),
+					AuthoritativeEngineBoots: 1,
+					AuthoritativeEngineTime:  1000,
+				},
+			}
+			if connErr := x.Connect(); connErr != nil {
+				t.Fatalf("connect error: %s", connErr)
+			}
+			defer x.Conn.Close()
+
+			// Send request - should get fatal REPORT error
+			_, getErr := x.Get([]string{"1.3.6.1.2.1.1.1.0"})
+
+			// Verify correct error returned
+			if !errors.Is(getErr, tc.expectedErr) {
+				t.Errorf("expected error %v, got %v", tc.expectedErr, getErr)
+			}
+
+			// Give server goroutine time to process
+			srvr.Close()
+			<-done
+
+			// Verify no retries occurred (fatal errors should not retry)
+			if requestCount > 1 {
+				t.Errorf("expected 1 request (no retries for fatal error), got %d", requestCount)
+			}
+		})
+	}
+}
+
+// buildTestReportPDU constructs a minimal SNMPv3 REPORT PDU with the given error OID.
+// The REPORT uses NoAuthNoPriv security level (msgFlags=0x00).
+func buildTestReportPDU(t *testing.T, oid string) []byte {
+	t.Helper()
+	engineID := string([]byte{0x80, 0x00, 0x1f, 0x88, 0x80})
+	return buildReportPDU(t, oid, engineID, 1, 1000, "testuser")
+}
+
+// buildReportPDU constructs an SNMPv3 REPORT PDU with the given parameters.
+func buildReportPDU(t *testing.T, oid, engineID string, boots, engineTime uint32, user string) []byte {
+	t.Helper()
+
+	packet := &SnmpPacket{
+		Version:       Version3,
+		PDUType:       Report,
+		MsgFlags:      NoAuthNoPriv,
+		SecurityModel: UserSecurityModel,
+		SecurityParameters: &UsmSecurityParameters{
+			AuthoritativeEngineID:    engineID,
+			AuthoritativeEngineBoots: boots,
+			AuthoritativeEngineTime:  engineTime,
+			UserName:                 user,
+		},
+		ContextEngineID: engineID,
+		MsgID:           1,
+		RequestID:       0, // REPORTs use 0 if original request-id couldn't be extracted
+		Variables: []SnmpPDU{
+			{
+				Name:  oid,
+				Type:  Counter32,
+				Value: uint32(1),
+			},
+		},
+	}
+
+	pduBytes, err := packet.MarshalMsg()
+	if err != nil {
+		t.Fatalf("MarshalMsg: %v", err)
+	}
+
+	return pduBytes
 }
