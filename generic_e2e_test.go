@@ -383,9 +383,11 @@ func TestGenericFailureUnknownHost(t *testing.T) {
 		t.Fatalf("Expected connection failure due to unknown host")
 	}
 
+	// Expect either DNS resolution failure or timeout (depending on system behavior)
 	lerr := strings.ToLower(err.Error())
-	if !strings.Contains(lerr, "no such host") && !strings.Contains(lerr, "i/o timeout") {
-		t.Fatalf("Expected connection error of type 'no such host' or 'i/o timeout'! Got => %v", err)
+	isDNSError := strings.Contains(lerr, "no such host")
+	if !isDNSError && !IsTimeoutError(err) && !strings.Contains(lerr, "timeout") {
+		t.Fatalf("Expected connection error of type 'no such host' or timeout! Got => %v", err)
 	}
 
 	_, err = Default.Get([]string{".1.3.6.1.2.1.1.1.0"}) // SNMP MIB-2 sysDescr
@@ -410,7 +412,8 @@ func TestGenericFailureConnectionTimeout(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Expected Get() to fail due to invalid IP")
 	}
-	if !strings.Contains(err.Error(), "timeout") {
+	// Check for timeout using IsTimeoutError or the wrapped message
+	if !IsTimeoutError(err) && !strings.Contains(err.Error(), "timeout") {
 		t.Fatalf("Expected timeout error. Got => %v", err)
 	}
 }

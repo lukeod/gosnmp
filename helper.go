@@ -41,6 +41,19 @@ var (
 
 // -- helper functions (mostly) in alphabetical order --------------------------
 
+// IsTimeoutError reports whether an error represents a timeout condition.
+// It checks both net.Error.Timeout() and os.ErrDeadlineExceeded.
+func IsTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout()
+	}
+	return errors.Is(err, os.ErrDeadlineExceeded)
+}
+
 // Check makes checking errors easy, so they actually get a minimal check
 func (x *GoSNMP) Check(err error) {
 	if err != nil {

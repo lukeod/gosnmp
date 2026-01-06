@@ -198,7 +198,7 @@ sendRetry:
 			}
 
 			x.Logger.Printf("Retry number %d. Last error was: %v", retries, err)
-			if withContextDeadline && strings.Contains(err.Error(), "timeout") {
+			if withContextDeadline && IsTimeoutError(err) {
 				err = context.DeadlineExceeded
 				break
 			}
@@ -206,7 +206,7 @@ sendRetry:
 				if err == nil {
 					err = fmt.Errorf("max retries (%d) exceeded", x.Retries)
 				}
-				if strings.Contains(err.Error(), "timeout") {
+				if IsTimeoutError(err) {
 					err = fmt.Errorf("request timeout (after %d retries)", retries-1)
 				}
 				break
@@ -217,7 +217,6 @@ sendRetry:
 			}
 			withContextDeadline = false
 		}
-		err = nil
 
 		if x.Context.Err() != nil {
 			return nil, x.Context.Err()

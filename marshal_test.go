@@ -1758,7 +1758,8 @@ func TestSendOneRequest_TCP_EOF_Reconnect(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error due to EOF, got nil")
 	}
-	if !strings.Contains(err.Error(), "timeout") && !strings.Contains(err.Error(), "max retries") {
+	// Accept either a raw timeout error or the wrapped "request timeout" message
+	if !IsTimeoutError(err) && !strings.Contains(err.Error(), "timeout") && !strings.Contains(err.Error(), "max retries") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

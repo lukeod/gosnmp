@@ -8,8 +8,10 @@ package gosnmp
 
 import (
 	"encoding/base64"
+	"errors"
 	"io"
 	"log"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -908,6 +910,43 @@ func TestMarshalFloat64(t *testing.T) {
 			}
 			if !checkByteEquality2(got, tt.want) {
 				t.Errorf("marshalFloat64() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// timeoutError implements net.Error with Timeout() returning true
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+// nonTimeoutNetError implements net.Error with Timeout() returning false
+type nonTimeoutNetError struct{}
+
+func (nonTimeoutNetError) Error() string   { return "connection refused" }
+func (nonTimeoutNetError) Timeout() bool   { return false }
+func (nonTimeoutNetError) Temporary() bool { return false }
+
+func TestIsTimeoutError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"plain error", errors.New("some error"), false},
+		{"net.Error with Timeout()=true", timeoutError{}, true},
+		{"net.Error with Timeout()=false", nonTimeoutNetError{}, false},
+		{"os.ErrDeadlineExceeded", os.ErrDeadlineExceeded, true},
+		{"wrapped os.ErrDeadlineExceeded", errors.Join(errors.New("wrap"), os.ErrDeadlineExceeded), true},
+		{"io.EOF", io.EOF, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsTimeoutError(tt.err); got != tt.want {
+				t.Errorf("IsTimeoutError() = %v, want %v", got, tt.want)
 			}
 		})
 	}
