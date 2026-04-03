@@ -629,6 +629,83 @@ func parseInt(bytes []byte) (int, error) {
 	return int(ret64), nil
 }
 
+// packetReader wraps a byte slice with a cursor, centralizing bounds
+// checking for SNMP packet parsing. All cursor advancement goes through
+// advance(), which rejects out-of-bounds positions.
+type packetReader struct {
+	data []byte
+	pos  int
+}
+
+func newPacketReader(data []byte, pos int) *packetReader {
+	return &packetReader{data: data, pos: pos}
+}
+
+// advance moves the cursor forward by n bytes.
+func (r *packetReader) advance(n int) error {
+	newPos := r.pos + n
+	if newPos < 0 || newPos > len(r.data) {
+		return fmt.Errorf("cursor out of bounds: position %d + %d = %d, packet length %d",
+			r.pos, n, newPos, len(r.data))
+	}
+	r.pos = newPos
+	return nil
+}
+
+// remaining returns the unread portion of the data.
+func (r *packetReader) remaining() []byte {
+	return r.data[r.pos:]
+}
+
+// position returns the current absolute cursor position.
+func (r *packetReader) position() int {
+	return r.pos
+}
+
+// setData replaces the underlying packet data, used when the packet
+// is modified during decryption or truncation.
+func (r *packetReader) setData(data []byte) {
+	r.data = data
+}
+
+// parseLength reads a BER TLV header at the current position, advances
+// past the header, and returns the full TLV length.
+func (r *packetReader) parseLength() (int, error) {
+	length, cursor, err := parseLength(r.remaining())
+	if err != nil {
+		return 0, err
+	}
+	if err := r.advance(cursor); err != nil {
+		return 0, err
+	}
+	return length, nil
+}
+
+// parseRawField reads a complete TLV at the current position, advances
+// past it, and returns the parsed value.
+func (r *packetReader) parseRawField(logger Logger, name string) (any, error) {
+	value, count, err := parseRawField(logger, r.remaining(), name)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.advance(count); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+// skipTLV advances past an entire TLV structure and returns its length.
+func (r *packetReader) skipTLV() (int, error) {
+	length, _, err := parseLength(r.remaining())
+	if err != nil {
+		return 0, err
+	}
+	if err := r.advance(length); err != nil {
+		return 0, err
+	}
+	return length, nil
+}
+
 // parseLength parses and calculates an snmp packet length
 // and returns an error when invalid data is detected
 //

@@ -863,14 +863,11 @@ func (sp *UsmSecurityParameters) encryptPacket(scopedPdu []byte) ([]byte, error)
 }
 
 func (sp *UsmSecurityParameters) decryptPacket(packet []byte, cursor int) ([]byte, error) {
-	_, cursorTmp, err := parseLength(packet[cursor:])
-	if err != nil {
+	r := newPacketReader(packet, cursor)
+	if _, err := r.parseLength(); err != nil {
 		return nil, err
 	}
-	cursorTmp += cursor
-	if cursorTmp > len(packet) {
-		return nil, errors.New("error decrypting ScopedPDU: truncated packet")
-	}
+	ciphertextStart := r.position()
 
 	switch sp.PrivacyProtocol {
 	case AES, AES192, AES256, AES192C, AES256C:
@@ -885,12 +882,12 @@ func (sp *UsmSecurityParameters) decryptPacket(packet []byte, cursor int) ([]byt
 		}
 		//nolint:staticcheck // RFC3826 Section 3.1.1.1 specifies CFB-128 mode for AES
 		stream := cipher.NewCFBDecrypter(block, iv[:])
-		plaintext := make([]byte, len(packet[cursorTmp:]))
-		stream.XORKeyStream(plaintext, packet[cursorTmp:])
+		plaintext := make([]byte, len(packet[ciphertextStart:]))
+		stream.XORKeyStream(plaintext, packet[ciphertextStart:])
 		copy(packet[cursor:], plaintext)
 		packet = packet[:cursor+len(plaintext)]
 	case DES:
-		if len(packet[cursorTmp:])%des.BlockSize != 0 {
+		if len(packet[ciphertextStart:])%des.BlockSize != 0 {
 			return nil, errors.New("error decrypting ScopedPDU: not multiple of des block size")
 		}
 		preiv := sp.PrivacyKey[8:]
@@ -904,8 +901,8 @@ func (sp *UsmSecurityParameters) decryptPacket(packet []byte, cursor int) ([]byt
 		}
 		mode := cipher.NewCBCDecrypter(block, iv[:])
 
-		plaintext := make([]byte, len(packet[cursorTmp:]))
-		mode.CryptBlocks(plaintext, packet[cursorTmp:])
+		plaintext := make([]byte, len(packet[ciphertextStart:]))
+		mode.CryptBlocks(plaintext, packet[ciphertextStart:])
 		copy(packet[cursor:], plaintext)
 		// truncate packet to remove extra space caused by the
 		// octetstring/length header that was just replaced
@@ -974,29 +971,23 @@ func (sp *UsmSecurityParameters) marshal(flags SnmpV3MsgFlags) ([]byte, error) {
 }
 
 func (sp *UsmSecurityParameters) unmarshal(flags SnmpV3MsgFlags, packet []byte, cursor int) (int, error) {
-	var err error
+	r := newPacketReader(packet, cursor)
 
-	if cursor >= len(packet) {
+	if len(r.remaining()) == 0 {
 		return 0, errors.New("error parsing SNMPV3 User Security Model parameters: end of packet")
 	}
 
-	if PDUType(packet[cursor]) != Sequence {
+	if PDUType(r.remaining()[0]) != Sequence {
 		return 0, errors.New("error parsing SNMPV3 User Security Model parameters")
 	}
-	_, cursorTmp, err := parseLength(packet[cursor:])
-	if err != nil {
+	if _, err := r.parseLength(); err != nil {
 		return 0, err
 	}
-	cursor += cursorTmp
-	if cursor > len(packet) {
-		return 0, errors.New("error parsing SNMPV3 User Security Model parameters: truncated packet")
-	}
 
-	rawMsgAuthoritativeEngineID, count, err := parseRawField(sp.Logger, packet[cursor:], "msgAuthoritativeEngineID")
+	rawMsgAuthoritativeEngineID, err := r.parseRawField(sp.Logger, "msgAuthoritativeEngineID")
 	if err != nil {
 		return 0, fmt.Errorf("error parsing SNMPV3 User Security Model msgAuthoritativeEngineID: %w", err)
 	}
-	cursor += count
 	if AuthoritativeEngineID, ok := rawMsgAuthoritativeEngineID.(string); ok {
 		if sp.AuthoritativeEngineID != AuthoritativeEngineID {
 			sp.AuthoritativeEngineID = AuthoritativeEngineID
@@ -1011,37 +1002,36 @@ func (sp *UsmSecurityParameters) unmarshal(flags SnmpV3MsgFlags, packet []byte, 
 		}
 	}
 
-	rawMsgAuthoritativeEngineBoots, count, err := parseRawField(sp.Logger, packet[cursor:], "msgAuthoritativeEngineBoots")
+	rawMsgAuthoritativeEngineBoots, err := r.parseRawField(sp.Logger, "msgAuthoritativeEngineBoots")
 	if err != nil {
 		return 0, fmt.Errorf("error parsing SNMPV3 User Security Model msgAuthoritativeEngineBoots: %w", err)
 	}
-	cursor += count
 	if AuthoritativeEngineBoots, ok := rawMsgAuthoritativeEngineBoots.(int); ok {
 		sp.AuthoritativeEngineBoots = uint32(AuthoritativeEngineBoots) //nolint:gosec
 		sp.Logger.Printf("Parsed authoritativeEngineBoots %d", AuthoritativeEngineBoots)
 	}
 
-	rawMsgAuthoritativeEngineTime, count, err := parseRawField(sp.Logger, packet[cursor:], "msgAuthoritativeEngineTime")
+	rawMsgAuthoritativeEngineTime, err := r.parseRawField(sp.Logger, "msgAuthoritativeEngineTime")
 	if err != nil {
 		return 0, fmt.Errorf("error parsing SNMPV3 User Security Model msgAuthoritativeEngineTime: %w", err)
 	}
-	cursor += count
 	if AuthoritativeEngineTime, ok := rawMsgAuthoritativeEngineTime.(int); ok {
 		sp.AuthoritativeEngineTime = uint32(AuthoritativeEngineTime) //nolint:gosec
 		sp.Logger.Printf("Parsed authoritativeEngineTime %d", AuthoritativeEngineTime)
 	}
 
-	rawMsgUserName, count, err := parseRawField(sp.Logger, packet[cursor:], "msgUserName")
+	rawMsgUserName, err := r.parseRawField(sp.Logger, "msgUserName")
 	if err != nil {
 		return 0, fmt.Errorf("error parsing SNMPV3 User Security Model msgUserName: %w", err)
 	}
-	cursor += count
 	if msgUserName, ok := rawMsgUserName.(string); ok {
 		sp.UserName = msgUserName
 		sp.Logger.Printf("Parsed userName %s", msgUserName)
 	}
 
-	rawMsgAuthParameters, count, err := parseRawField(sp.Logger, packet[cursor:], "msgAuthenticationParameters")
+	// Save position before parsing auth parameters — needed for MAC blanking below
+	authParamPos := r.position()
+	rawMsgAuthParameters, err := r.parseRawField(sp.Logger, "msgAuthenticationParameters")
 	if err != nil {
 		return 0, fmt.Errorf("error parsing SNMPV3 User Security Model msgAuthenticationParameters: %w", err)
 	}
@@ -1056,15 +1046,13 @@ func (sp *UsmSecurityParameters) unmarshal(flags SnmpV3MsgFlags, packet []byte, 
 		if sp.AuthenticationProtocol <= NoAuth {
 			return 0, errors.New("error parsing SNMPv3 User Security Model: authentication parameters are not configured to parse incoming authenticated message")
 		}
-		copy(packet[cursor+2:cursor+len(macVarbinds[sp.AuthenticationProtocol])], macVarbinds[sp.AuthenticationProtocol][2:])
+		copy(packet[authParamPos+2:authParamPos+len(macVarbinds[sp.AuthenticationProtocol])], macVarbinds[sp.AuthenticationProtocol][2:])
 	}
-	cursor += count
 
-	rawMsgPrivacyParameters, count, err := parseRawField(sp.Logger, packet[cursor:], "msgPrivacyParameters")
+	rawMsgPrivacyParameters, err := r.parseRawField(sp.Logger, "msgPrivacyParameters")
 	if err != nil {
 		return 0, fmt.Errorf("error parsing SNMPV3 User Security Model msgPrivacyParameters: %w", err)
 	}
-	cursor += count
 	if msgPrivacyParameters, ok := rawMsgPrivacyParameters.(string); ok {
 		sp.PrivacyParameters = []byte(msgPrivacyParameters)
 		sp.Logger.Printf("Parsed privacyParameters %s", msgPrivacyParameters)
@@ -1075,5 +1063,5 @@ func (sp *UsmSecurityParameters) unmarshal(flags SnmpV3MsgFlags, packet []byte, 
 		}
 	}
 
-	return cursor, nil
+	return r.position(), nil
 }

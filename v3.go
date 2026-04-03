@@ -364,26 +364,22 @@ func (packet *SnmpPacket) prepareV3ScopedPDU() ([]byte, error) {
 func (x *GoSNMP) unmarshalV3Header(packet []byte,
 	cursor int,
 	response *SnmpPacket) (int, error) {
-	if PDUType(packet[cursor]) != Sequence {
+	r := newPacketReader(packet, cursor)
+
+	if len(r.remaining()) == 0 {
+		return 0, errors.New("error parsing SNMPV3 Header: truncated packet")
+	}
+	if PDUType(r.remaining()[0]) != Sequence {
 		return 0, fmt.Errorf("invalid SNMPV3 Header")
 	}
 
-	_, cursorTmp, err := parseLength(packet[cursor:])
-	if err != nil {
+	if _, err := r.parseLength(); err != nil {
 		return 0, err
 	}
-	cursor += cursorTmp
-	if cursor > len(packet) {
-		return 0, errors.New("error parsing SNMPV3 message ID: truncted packet")
-	}
 
-	rawMsgID, count, err := parseRawField(x.Logger, packet[cursor:], "msgID")
+	rawMsgID, err := r.parseRawField(x.Logger, "msgID")
 	if err != nil {
 		return 0, fmt.Errorf("error parsing SNMPV3 message ID: %w", err)
-	}
-	cursor += count
-	if cursor < 0 || cursor > len(packet) {
-		return 0, errors.New("error parsing SNMPV3 message ID: truncted packet")
 	}
 
 	if MsgID, ok := rawMsgID.(int); ok {
@@ -391,13 +387,9 @@ func (x *GoSNMP) unmarshalV3Header(packet []byte,
 		x.Logger.Printf("Parsed message ID %d", MsgID)
 	}
 
-	rawMsgMaxSize, count, err := parseRawField(x.Logger, packet[cursor:], "msgMaxSize")
+	rawMsgMaxSize, err := r.parseRawField(x.Logger, "msgMaxSize")
 	if err != nil {
 		return 0, fmt.Errorf("error parsing SNMPV3 msgMaxSize: %w", err)
-	}
-	cursor += count
-	if cursor < 0 || cursor > len(packet) {
-		return 0, errors.New("error parsing SNMPV3 message ID: truncted packet")
 	}
 
 	if MsgMaxSize, ok := rawMsgMaxSize.(int); ok {
@@ -405,13 +397,9 @@ func (x *GoSNMP) unmarshalV3Header(packet []byte,
 		x.Logger.Printf("Parsed message max size %d", MsgMaxSize)
 	}
 
-	rawMsgFlags, count, err := parseRawField(x.Logger, packet[cursor:], "msgFlags")
+	rawMsgFlags, err := r.parseRawField(x.Logger, "msgFlags")
 	if err != nil {
 		return 0, fmt.Errorf("error parsing SNMPV3 msgFlags: %w", err)
-	}
-	cursor += count
-	if cursor < 0 || cursor > len(packet) {
-		return 0, errors.New("error parsing SNMPV3 message ID: truncted packet")
 	}
 
 	if MsgFlags, ok := rawMsgFlags.(string); ok && len(MsgFlags) > 0 {
@@ -419,13 +407,9 @@ func (x *GoSNMP) unmarshalV3Header(packet []byte,
 		x.Logger.Printf("parsed msg flags %s", MsgFlags)
 	}
 
-	rawSecModel, count, err := parseRawField(x.Logger, packet[cursor:], "msgSecurityModel")
+	rawSecModel, err := r.parseRawField(x.Logger, "msgSecurityModel")
 	if err != nil {
 		return 0, fmt.Errorf("error parsing SNMPV3 msgSecModel: %w", err)
-	}
-	cursor += count
-	if cursor < 0 || cursor >= len(packet) {
-		return 0, errors.New("error parsing SNMPV3 message ID: truncted packet")
 	}
 
 	if SecModel, ok := rawSecModel.(int); ok {
@@ -433,28 +417,26 @@ func (x *GoSNMP) unmarshalV3Header(packet []byte,
 		x.Logger.Printf("Parsed security model %d", SecModel)
 	}
 
-	if PDUType(packet[cursor]) != PDUType(OctetString) {
+	if len(r.remaining()) == 0 {
+		return 0, errors.New("error parsing SNMPV3 Security Parameters: truncated packet")
+	}
+	if PDUType(r.remaining()[0]) != PDUType(OctetString) {
 		return 0, errors.New("invalid SNMPV3 Security Parameters")
 	}
-	_, cursorTmp, err = parseLength(packet[cursor:])
-	if err != nil {
+	if _, err := r.parseLength(); err != nil {
 		return 0, err
-	}
-	cursor += cursorTmp
-	if cursor > len(packet) {
-		return 0, errors.New("error parsing SNMPV3 message ID: truncted packet")
 	}
 	if response.SecurityParameters == nil {
 		response.SecurityParameters = &UsmSecurityParameters{Logger: x.Logger}
 	}
 
-	cursor, err = response.SecurityParameters.unmarshal(response.MsgFlags, packet, cursor)
+	newCursor, err := response.SecurityParameters.unmarshal(response.MsgFlags, packet, r.position())
 	if err != nil {
 		return 0, err
 	}
-	x.Logger.Printf("Parsed Security Parameters. now offset=%v,", cursor)
+	x.Logger.Printf("Parsed Security Parameters. now offset=%v,", newCursor)
 
-	return cursor, nil
+	return newCursor, nil
 }
 
 func (x *GoSNMP) decryptPacket(packet []byte, cursor int, response *SnmpPacket) ([]byte, int, error) {
@@ -476,7 +458,8 @@ func (x *GoSNMP) decryptPacket(packet []byte, cursor int, response *SnmpPacket) 
 		fallthrough
 	case Sequence:
 		// pdu is plaintext or has been decrypted
-		tlength, cursorTmp, err := parseLength(packet[cursor:])
+		r := newPacketReader(packet, cursor)
+		tlength, err := r.parseLength()
 		if err != nil {
 			return nil, 0, err
 		}
@@ -487,32 +470,22 @@ func (x *GoSNMP) decryptPacket(packet []byte, cursor int, response *SnmpPacket) 
 				return nil, 0, errors.New("error parsing SNMPV3: truncated packet")
 			}
 			packet = packet[:cursor+tlength]
-		}
-		cursor += cursorTmp
-		if cursor > len(packet) {
-			return nil, 0, errors.New("error parsing SNMPV3: truncated packet")
+			r.setData(packet)
 		}
 
-		rawContextEngineID, count, err := parseRawField(x.Logger, packet[cursor:], "contextEngineID")
+		rawContextEngineID, err := r.parseRawField(x.Logger, "contextEngineID")
 		if err != nil {
 			return nil, 0, fmt.Errorf("error parsing SNMPV3 contextEngineID: %w", err)
-		}
-		cursor += count
-		if cursor < 0 || cursor > len(packet) {
-			return nil, 0, errors.New("error parsing SNMPV3: truncated packet")
 		}
 
 		if contextEngineID, ok := rawContextEngineID.(string); ok {
 			response.ContextEngineID = contextEngineID
 			x.Logger.Printf("Parsed contextEngineID %s", contextEngineID)
 		}
-		rawContextName, count, err := parseRawField(x.Logger, packet[cursor:], "contextName")
+
+		rawContextName, err := r.parseRawField(x.Logger, "contextName")
 		if err != nil {
 			return nil, 0, fmt.Errorf("error parsing SNMPV3 contextName: %w", err)
-		}
-		cursor += count
-		if cursor < 0 || cursor > len(packet) {
-			return nil, 0, errors.New("error parsing SNMPV3: truncated packet")
 		}
 
 		if contextName, ok := rawContextName.(string); ok {
@@ -520,8 +493,9 @@ func (x *GoSNMP) decryptPacket(packet []byte, cursor int, response *SnmpPacket) 
 			x.Logger.Printf("Parsed contextName %s", contextName)
 		}
 
+		return packet, r.position(), nil
+
 	default:
 		return nil, 0, errors.New("error parsing SNMPV3 scoped PDU")
 	}
-	return packet, cursor, nil
 }

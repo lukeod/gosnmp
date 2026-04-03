@@ -495,6 +495,239 @@ func checkByteEquality2(a, b []byte) bool {
 	return true
 }
 
+func TestPacketReaderAdvance(t *testing.T) {
+	data := []byte{0x30, 0x05, 0x01, 0x02, 0x03}
+	r := newPacketReader(data, 0)
+
+	if r.position() != 0 {
+		t.Fatalf("initial position = %d, want 0", r.position())
+	}
+
+	// valid advance
+	if err := r.advance(2); err != nil {
+		t.Fatalf("advance(2) unexpected error: %v", err)
+	}
+	if r.position() != 2 {
+		t.Fatalf("position after advance(2) = %d, want 2", r.position())
+	}
+
+	// advance to exact end
+	if err := r.advance(3); err != nil {
+		t.Fatalf("advance(3) to end unexpected error: %v", err)
+	}
+	if r.position() != 5 {
+		t.Fatalf("position at end = %d, want 5", r.position())
+	}
+	if len(r.remaining()) != 0 {
+		t.Fatalf("remaining at end = %d, want 0", len(r.remaining()))
+	}
+
+	// advance past end
+	if err := r.advance(1); err == nil {
+		t.Fatal("advance(1) past end should error")
+	}
+
+	// negative result
+	r2 := newPacketReader(data, 1)
+	if err := r2.advance(-2); err == nil {
+		t.Fatal("advance(-2) from pos 1 should error")
+	}
+}
+
+func TestPacketReaderParseLength(t *testing.T) {
+	// OctetString with 3-byte value: tag=0x04, len=0x03, then 3 bytes
+	data := []byte{0x04, 0x03, 0xAA, 0xBB, 0xCC}
+	r := newPacketReader(data, 0)
+
+	length, err := r.parseLength()
+	if err != nil {
+		t.Fatalf("parseLength unexpected error: %v", err)
+	}
+	// length should be total TLV = 5
+	if length != 5 {
+		t.Fatalf("parseLength length = %d, want 5", length)
+	}
+	// cursor should have advanced past the header (tag + 1 byte length = 2)
+	if r.position() != 2 {
+		t.Fatalf("position after parseLength = %d, want 2", r.position())
+	}
+}
+
+func TestPacketReaderParseRawField(t *testing.T) {
+	// Integer TLV: tag=0x02, len=0x01, value=0x05
+	data := []byte{0x02, 0x01, 0x05}
+	r := newPacketReader(data, 0)
+
+	val, err := r.parseRawField(NewLogger(log.New(io.Discard, "", 0)), "test-int")
+	if err != nil {
+		t.Fatalf("parseRawField unexpected error: %v", err)
+	}
+	intVal, ok := val.(int)
+	if !ok {
+		t.Fatalf("parseRawField returned %T, want int", val)
+	}
+	if intVal != 5 {
+		t.Fatalf("parseRawField value = %d, want 5", intVal)
+	}
+	// cursor should have advanced past the entire TLV (3 bytes)
+	if r.position() != 3 {
+		t.Fatalf("position after parseRawField = %d, want 3", r.position())
+	}
+}
+
+func TestPacketReaderSkipTLV(t *testing.T) {
+	// Two TLVs: Integer(5) then OctetString("hi")
+	data := []byte{
+		0x02, 0x01, 0x05, // Integer, len 1, value 5
+		0x04, 0x02, 0x68, 0x69, // OctetString, len 2, "hi"
+	}
+	r := newPacketReader(data, 0)
+
+	length, err := r.skipTLV()
+	if err != nil {
+		t.Fatalf("skipTLV unexpected error: %v", err)
+	}
+	if length != 3 {
+		t.Fatalf("skipTLV length = %d, want 3", length)
+	}
+	if r.position() != 3 {
+		t.Fatalf("position after skipTLV = %d, want 3", r.position())
+	}
+
+	// skip second TLV
+	length, err = r.skipTLV()
+	if err != nil {
+		t.Fatalf("second skipTLV unexpected error: %v", err)
+	}
+	if length != 4 {
+		t.Fatalf("second skipTLV length = %d, want 4", length)
+	}
+	if r.position() != 7 {
+		t.Fatalf("position after second skipTLV = %d, want 7", r.position())
+	}
+}
+
+func TestPacketReaderEmptyData(t *testing.T) {
+	r := newPacketReader([]byte{}, 0)
+
+	// parseLength returns (0, 0, nil) for empty input via the len < 2 fallback
+	length, err := r.parseLength()
+	if err != nil {
+		t.Fatalf("parseLength on empty data unexpected error: %v", err)
+	}
+	if length != 0 {
+		t.Fatalf("parseLength on empty data length = %d, want 0", length)
+	}
+
+	// parseRawField rejects empty data
+	if _, err := r.parseRawField(NewLogger(log.New(io.Discard, "", 0)), "test"); err == nil {
+		t.Fatal("parseRawField on empty data should error")
+	}
+}
+
+func TestPacketReaderSetData(t *testing.T) {
+	data := []byte{0x01, 0x02, 0x03, 0x04, 0x05}
+	r := newPacketReader(data, 2)
+
+	if len(r.remaining()) != 3 {
+		t.Fatalf("initial remaining = %d, want 3", len(r.remaining()))
+	}
+
+	// simulate truncation (as decryptPacket does)
+	r.setData(data[:3])
+	if len(r.remaining()) != 1 {
+		t.Fatalf("remaining after setData = %d, want 1", len(r.remaining()))
+	}
+}
+
+// TestPacketReaderRejectsOverflow demonstrates that packetReader.advance
+// catches integer overflow that the old manual "cursor < 0" checks were
+// added to detect (commit d61b830). parseRawField can return a count
+// derived from a crafted BER length that, when added to a large cursor,
+// overflows int to negative. The old pattern was:
+//
+//	cursor += count
+//	if cursor < 0 || cursor > len(packet) { ... }
+//
+// With packetReader, advance() rejects this before the cursor is updated.
+func TestPacketReaderRejectsOverflow(t *testing.T) {
+	data := make([]byte, 10)
+	r := newPacketReader(data, 5)
+
+	// Simulate what happens if a crafted BER length causes parseLength
+	// to return a huge cursor value (hypothetically bypassing its own
+	// checks). advance() must reject it regardless.
+	err := r.advance(1<<63 - 1) // MaxInt — would wrap to negative when added
+	if err == nil {
+		t.Fatal("advance with MaxInt should error, got nil")
+	}
+
+	// Position must not have changed
+	if r.position() != 5 {
+		t.Fatalf("position changed to %d after rejected advance", r.position())
+	}
+}
+
+// TestPacketReaderSequentialFieldParsing mirrors the real unmarshal pattern:
+// parseLength to skip a SEQUENCE header, then multiple parseRawField calls.
+// Verifies the reader tracks position correctly across a realistic sequence
+// of operations.
+func TestPacketReaderSequentialFieldParsing(t *testing.T) {
+	// Build a minimal USM-like structure:
+	// SEQUENCE { INTEGER(42), OctetString("hi") }
+	packet := []byte{
+		0x30, 0x08, // SEQUENCE, length 8 (total TLV = 10)
+		0x02, 0x01, 0x2a, // INTEGER, length 1, value 42
+		0x04, 0x02, 0x68, 0x69, // OctetString, length 2, "hi"
+		// extra byte to prove we stop at the right place
+		0xff,
+	}
+
+	r := newPacketReader(packet, 0)
+	logger := NewLogger(log.New(io.Discard, "", 0))
+
+	// Skip SEQUENCE header (advances past tag+length = 2 bytes)
+	seqLength, err := r.parseLength()
+	if err != nil {
+		t.Fatalf("parseLength: %v", err)
+	}
+	if seqLength != 10 {
+		t.Fatalf("sequence TLV length = %d, want 10", seqLength)
+	}
+	if r.position() != 2 {
+		t.Fatalf("position after SEQUENCE header = %d, want 2", r.position())
+	}
+
+	// Parse first field
+	val1, err := r.parseRawField(logger, "field1")
+	if err != nil {
+		t.Fatalf("parseRawField field1: %v", err)
+	}
+	if val1.(int) != 42 {
+		t.Fatalf("field1 = %v, want 42", val1)
+	}
+	if r.position() != 5 {
+		t.Fatalf("position after field1 = %d, want 5", r.position())
+	}
+
+	// Parse second field
+	val2, err := r.parseRawField(logger, "field2")
+	if err != nil {
+		t.Fatalf("parseRawField field2: %v", err)
+	}
+	if val2.(string) != "hi" {
+		t.Fatalf("field2 = %v, want \"hi\"", val2)
+	}
+	if r.position() != 9 {
+		t.Fatalf("position after field2 = %d, want 9", r.position())
+	}
+
+	// Remaining should be just the trailing 0xff
+	if len(r.remaining()) != 1 {
+		t.Fatalf("remaining = %d, want 1", len(r.remaining()))
+	}
+}
+
 // TestParseLength tests the parseLength function with various BER length encodings
 func TestParseLength(t *testing.T) {
 	tests := []struct {
