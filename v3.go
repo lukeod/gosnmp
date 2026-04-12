@@ -364,7 +364,10 @@ func (packet *SnmpPacket) prepareV3ScopedPDU() ([]byte, error) {
 func (x *GoSNMP) unmarshalV3Header(packet []byte,
 	cursor int,
 	response *SnmpPacket) (int, error) {
-	r := newPacketReader(packet, cursor)
+	r, err := newPacketReader(packet, cursor)
+	if err != nil {
+		return 0, err
+	}
 
 	if len(r.remaining()) == 0 {
 		return 0, errors.New("error parsing SNMPV3 Header: truncated packet")
@@ -458,7 +461,10 @@ func (x *GoSNMP) decryptPacket(packet []byte, cursor int, response *SnmpPacket) 
 		fallthrough
 	case Sequence:
 		// pdu is plaintext or has been decrypted
-		r := newPacketReader(packet, cursor)
+		r, err := newPacketReader(packet, cursor)
+		if err != nil {
+			return nil, 0, err
+		}
 		tlength, err := r.parseLength()
 		if err != nil {
 			return nil, 0, err
@@ -470,7 +476,9 @@ func (x *GoSNMP) decryptPacket(packet []byte, cursor int, response *SnmpPacket) 
 				return nil, 0, errors.New("error parsing SNMPV3: truncated packet")
 			}
 			packet = packet[:cursor+tlength]
-			r.setData(packet)
+			if err := r.setData(packet); err != nil {
+				return nil, 0, err
+			}
 		}
 
 		rawContextEngineID, err := r.parseRawField(x.Logger, "contextEngineID")

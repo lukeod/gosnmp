@@ -637,8 +637,11 @@ type packetReader struct {
 	pos  int
 }
 
-func newPacketReader(data []byte, pos int) *packetReader {
-	return &packetReader{data: data, pos: pos}
+func newPacketReader(data []byte, pos int) (*packetReader, error) {
+	if pos < 0 || pos > len(data) {
+		return nil, fmt.Errorf("newPacketReader: position %d out of range for data length %d", pos, len(data))
+	}
+	return &packetReader{data: data, pos: pos}, nil
 }
 
 // advance moves the cursor forward by n bytes.
@@ -664,8 +667,12 @@ func (r *packetReader) position() int {
 
 // setData replaces the underlying packet data, used when the packet
 // is modified during decryption or truncation.
-func (r *packetReader) setData(data []byte) {
+func (r *packetReader) setData(data []byte) error {
+	if r.pos > len(data) {
+		return fmt.Errorf("setData: current position %d out of range for new data length %d", r.pos, len(data))
+	}
 	r.data = data
+	return nil
 }
 
 // parseLength reads a BER TLV header at the current position, advances

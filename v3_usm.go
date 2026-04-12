@@ -863,7 +863,10 @@ func (sp *UsmSecurityParameters) encryptPacket(scopedPdu []byte) ([]byte, error)
 }
 
 func (sp *UsmSecurityParameters) decryptPacket(packet []byte, cursor int) ([]byte, error) {
-	r := newPacketReader(packet, cursor)
+	r, err := newPacketReader(packet, cursor)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := r.parseLength(); err != nil {
 		return nil, err
 	}
@@ -971,7 +974,10 @@ func (sp *UsmSecurityParameters) marshal(flags SnmpV3MsgFlags) ([]byte, error) {
 }
 
 func (sp *UsmSecurityParameters) unmarshal(flags SnmpV3MsgFlags, packet []byte, cursor int) (int, error) {
-	r := newPacketReader(packet, cursor)
+	r, err := newPacketReader(packet, cursor)
+	if err != nil {
+		return 0, err
+	}
 
 	if len(r.remaining()) == 0 {
 		return 0, errors.New("error parsing SNMPV3 User Security Model parameters: end of packet")

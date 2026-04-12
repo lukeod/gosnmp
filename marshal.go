@@ -945,7 +945,10 @@ func (x *GoSNMP) unmarshalVersionFromHeader(packet []byte, response *SnmpPacket)
 
 	response.Variables = make([]SnmpPDU, 0, 5)
 
-	r := newPacketReader(packet, 0)
+	r, err := newPacketReader(packet, 0)
+	if err != nil {
+		return 0, 0, err
+	}
 
 	// First bytes should be 0x30
 	if PDUType(packet[0]) != Sequence {
@@ -990,7 +993,10 @@ func (x *GoSNMP) unmarshalHeader(packet []byte, response *SnmpPacket) (int, erro
 		x.Logger.Printf("UnmarshalV3Header done. [with SecurityParameters]. Header Size %d. Last 4 Bytes=[%v]", cursor-oldcursor, packet[cursor-4:cursor])
 	} else {
 		// Parse community
-		r := newPacketReader(packet, cursor)
+		r, err := newPacketReader(packet, cursor)
+		if err != nil {
+			return 0, err
+		}
 		rawCommunity, err := r.parseRawField(x.Logger, "community")
 		if err != nil {
 			return 0, fmt.Errorf("error parsing community string: %w", err)
@@ -1041,7 +1047,10 @@ func (x *GoSNMP) unmarshalPayload(packet []byte, cursor int, response *SnmpPacke
 }
 
 func (x *GoSNMP) unmarshalResponse(packet []byte, response *SnmpPacket) error {
-	r := newPacketReader(packet, 0)
+	r, err := newPacketReader(packet, 0)
+	if err != nil {
+		return err
+	}
 
 	getResponseLength, err := r.parseLength()
 	if err != nil {
@@ -1111,7 +1120,10 @@ func (x *GoSNMP) unmarshalResponse(packet []byte, response *SnmpPacket) error {
 }
 
 func (x *GoSNMP) unmarshalTrapV1(packet []byte, response *SnmpPacket) error {
-	r := newPacketReader(packet, 0)
+	r, err := newPacketReader(packet, 0)
+	if err != nil {
+		return err
+	}
 
 	getResponseLength, err := r.parseLength()
 	if err != nil {
@@ -1190,7 +1202,10 @@ func (x *GoSNMP) unmarshalVBL(packet []byte, response *SnmpPacket) error {
 		return fmt.Errorf("expected a sequence when unmarshalling a VBL, got %x", packet[0])
 	}
 
-	r := newPacketReader(packet, 0)
+	r, err := newPacketReader(packet, 0)
+	if err != nil {
+		return err
+	}
 
 	vblLength, err := r.parseLength()
 	if err != nil {

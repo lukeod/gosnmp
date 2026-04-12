@@ -497,7 +497,10 @@ func checkByteEquality2(a, b []byte) bool {
 
 func TestPacketReaderAdvance(t *testing.T) {
 	data := []byte{0x30, 0x05, 0x01, 0x02, 0x03}
-	r := newPacketReader(data, 0)
+	r, err := newPacketReader(data, 0)
+	if err != nil {
+		t.Fatalf("newPacketReader: %v", err)
+	}
 
 	if r.position() != 0 {
 		t.Fatalf("initial position = %d, want 0", r.position())
@@ -528,7 +531,10 @@ func TestPacketReaderAdvance(t *testing.T) {
 	}
 
 	// negative result
-	r2 := newPacketReader(data, 1)
+	r2, err := newPacketReader(data, 1)
+	if err != nil {
+		t.Fatalf("newPacketReader: %v", err)
+	}
 	if err := r2.advance(-2); err == nil {
 		t.Fatal("advance(-2) from pos 1 should error")
 	}
@@ -537,7 +543,10 @@ func TestPacketReaderAdvance(t *testing.T) {
 func TestPacketReaderParseLength(t *testing.T) {
 	// OctetString with 3-byte value: tag=0x04, len=0x03, then 3 bytes
 	data := []byte{0x04, 0x03, 0xAA, 0xBB, 0xCC}
-	r := newPacketReader(data, 0)
+	r, err := newPacketReader(data, 0)
+	if err != nil {
+		t.Fatalf("newPacketReader: %v", err)
+	}
 
 	length, err := r.parseLength()
 	if err != nil {
@@ -556,7 +565,10 @@ func TestPacketReaderParseLength(t *testing.T) {
 func TestPacketReaderParseRawField(t *testing.T) {
 	// Integer TLV: tag=0x02, len=0x01, value=0x05
 	data := []byte{0x02, 0x01, 0x05}
-	r := newPacketReader(data, 0)
+	r, err := newPacketReader(data, 0)
+	if err != nil {
+		t.Fatalf("newPacketReader: %v", err)
+	}
 
 	val, err := r.parseRawField(NewLogger(log.New(io.Discard, "", 0)), "test-int")
 	if err != nil {
@@ -581,7 +593,10 @@ func TestPacketReaderSkipTLV(t *testing.T) {
 		0x02, 0x01, 0x05, // Integer, len 1, value 5
 		0x04, 0x02, 0x68, 0x69, // OctetString, len 2, "hi"
 	}
-	r := newPacketReader(data, 0)
+	r, err := newPacketReader(data, 0)
+	if err != nil {
+		t.Fatalf("newPacketReader: %v", err)
+	}
 
 	length, err := r.skipTLV()
 	if err != nil {
@@ -608,7 +623,10 @@ func TestPacketReaderSkipTLV(t *testing.T) {
 }
 
 func TestPacketReaderEmptyData(t *testing.T) {
-	r := newPacketReader([]byte{}, 0)
+	r, err := newPacketReader([]byte{}, 0)
+	if err != nil {
+		t.Fatalf("newPacketReader: %v", err)
+	}
 
 	// parseLength returns (0, 0, nil) for empty input via the len < 2 fallback
 	length, err := r.parseLength()
@@ -627,16 +645,57 @@ func TestPacketReaderEmptyData(t *testing.T) {
 
 func TestPacketReaderSetData(t *testing.T) {
 	data := []byte{0x01, 0x02, 0x03, 0x04, 0x05}
-	r := newPacketReader(data, 2)
+	r, err := newPacketReader(data, 2)
+	if err != nil {
+		t.Fatalf("newPacketReader: %v", err)
+	}
 
 	if len(r.remaining()) != 3 {
 		t.Fatalf("initial remaining = %d, want 3", len(r.remaining()))
 	}
 
 	// simulate truncation (as decryptPacket does)
-	r.setData(data[:3])
+	if err := r.setData(data[:3]); err != nil {
+		t.Fatalf("setData unexpected error: %v", err)
+	}
 	if len(r.remaining()) != 1 {
 		t.Fatalf("remaining after setData = %d, want 1", len(r.remaining()))
+	}
+}
+
+func TestNewPacketReaderRejectsInvalidPos(t *testing.T) {
+	data := []byte{0x01, 0x02, 0x03}
+
+	// position beyond data length
+	if _, err := newPacketReader(data, 4); err == nil {
+		t.Fatal("pos > len(data) should error")
+	}
+
+	// negative position
+	if _, err := newPacketReader(data, -1); err == nil {
+		t.Fatal("pos < 0 should error")
+	}
+
+	// boundary: pos == len(data) is valid (empty remaining)
+	r, err := newPacketReader(data, 3)
+	if err != nil {
+		t.Fatalf("pos == len(data) unexpected error: %v", err)
+	}
+	if len(r.remaining()) != 0 {
+		t.Fatalf("remaining at end = %d, want 0", len(r.remaining()))
+	}
+}
+
+func TestPacketReaderSetDataRejectsInvalidPos(t *testing.T) {
+	data := []byte{0x01, 0x02, 0x03, 0x04, 0x05}
+	r, err := newPacketReader(data, 4)
+	if err != nil {
+		t.Fatalf("newPacketReader: %v", err)
+	}
+
+	// shrink data so pos is beyond new length
+	if err := r.setData(data[:2]); err == nil {
+		t.Fatal("setData with pos > len(newData) should error")
 	}
 }
 
@@ -652,12 +711,15 @@ func TestPacketReaderSetData(t *testing.T) {
 // With packetReader, advance() rejects this before the cursor is updated.
 func TestPacketReaderRejectsOverflow(t *testing.T) {
 	data := make([]byte, 10)
-	r := newPacketReader(data, 5)
+	r, err := newPacketReader(data, 5)
+	if err != nil {
+		t.Fatalf("newPacketReader: %v", err)
+	}
 
 	// Simulate what happens if a crafted BER length causes parseLength
 	// to return a huge cursor value (hypothetically bypassing its own
 	// checks). advance() must reject it regardless.
-	err := r.advance(1<<63 - 1) // MaxInt — would wrap to negative when added
+	err = r.advance(1<<63 - 1) // MaxInt — would wrap to negative when added
 	if err == nil {
 		t.Fatal("advance with MaxInt should error, got nil")
 	}
@@ -683,7 +745,10 @@ func TestPacketReaderSequentialFieldParsing(t *testing.T) {
 		0xff,
 	}
 
-	r := newPacketReader(packet, 0)
+	r, err := newPacketReader(packet, 0)
+	if err != nil {
+		t.Fatalf("newPacketReader: %v", err)
+	}
 	logger := NewLogger(log.New(io.Discard, "", 0))
 
 	// Skip SEQUENCE header (advances past tag+length = 2 bytes)
