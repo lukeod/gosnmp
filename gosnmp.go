@@ -12,10 +12,12 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"maps"
 	"math"
 	"math/big"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -304,6 +306,71 @@ func (x *GoSNMP) Close() error {
 	return err
 }
 
+// Copy returns an unconnected duplicate of x sharing its configuration.
+//
+// Conn is not copied; the caller must call Connect on the returned value
+// before use. SecurityParameters are deep-copied including any discovered
+// SNMPv3 engine state, so the copy skips engine discovery. Key material
+// byte slices share backing arrays with the original; replace rather than
+// mutate them. If LocalAddr contains a port it is replaced with 0 so copies
+// do not contend for the same local bind; requests from copies may
+// therefore use different source ports than the original.
+//
+// Logger, Context, Control and the message hook functions are shared with
+// the original. The AppOpts map is shallow-copied: keys may be set
+// independently on each instance, but values are shared. Copy does not
+// synchronize with concurrent use of x; only copy a connection that is not
+// being used by another goroutine.
+//
+// Copy is the supported way to fan SNMP requests out across goroutines: a
+// connection must not be used concurrently, so create one copy per
+// goroutine instead.
+func (x *GoSNMP) Copy() *GoSNMP {
+	c := &GoSNMP{
+		Target:                      x.Target,
+		Port:                        x.Port,
+		Transport:                   x.Transport,
+		Community:                   x.Community,
+		Version:                     x.Version,
+		Context:                     x.Context,
+		Timeout:                     x.Timeout,
+		Retries:                     x.Retries,
+		ExponentialTimeout:          x.ExponentialTimeout,
+		Logger:                      x.Logger,
+		PreSend:                     x.PreSend,
+		OnSent:                      x.OnSent,
+		OnRecv:                      x.OnRecv,
+		OnRetry:                     x.OnRetry,
+		OnFinish:                    x.OnFinish,
+		MaxOids:                     x.MaxOids,
+		MaxRepetitions:              x.MaxRepetitions,
+		NonRepeaters:                x.NonRepeaters,
+		UseUnconnectedUDPSocket:     x.UseUnconnectedUDPSocket,
+		Control:                     x.Control,
+		LocalAddr:                   zeroPort(x.LocalAddr),
+		AppOpts:                     maps.Clone(x.AppOpts),
+		MsgFlags:                    x.MsgFlags,
+		SecurityModel:               x.SecurityModel,
+		TrapSecurityParametersTable: x.TrapSecurityParametersTable,
+		ContextEngineID:             x.ContextEngineID,
+		ContextName:                 x.ContextName,
+	}
+	if x.SecurityParameters != nil {
+		c.SecurityParameters = x.SecurityParameters.Copy()
+	}
+	return c
+}
+
+// zeroPort replaces the port of a host:port address with 0 so the OS picks
+// a free port. Addresses without a port are returned unchanged.
+func zeroPort(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return net.JoinHostPort(host, "0")
+}
+
 // connect to address addr on the given network
 //
 // https://golang.org/pkg/net/#Dial gives acceptable network values as:
@@ -316,7 +383,12 @@ func (x *GoSNMP) connect(networkSuffix string) error {
 		return err
 	}
 
-	x.Transport += networkSuffix
+	// Replace any IPv4/IPv6 qualifier already present (from a previous
+	// connect, or copied from a connected value) rather than appending to
+	// it, so reconnecting cannot produce networks like "udp44".
+	if networkSuffix != "" {
+		x.Transport = strings.TrimRight(x.Transport, "46") + networkSuffix
+	}
 	if err = x.netConnect(); err != nil {
 		return fmt.Errorf("error establishing connection to host: %w", err)
 	}

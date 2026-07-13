@@ -242,6 +242,9 @@ func (sp *UsmSecurityParameters) Log() {
 
 // Copy method for UsmSecurityParameters used to copy a SnmpV3SecurityParameters without knowing it's implementation
 func (sp *UsmSecurityParameters) Copy() SnmpV3SecurityParameters {
+	if sp == nil {
+		return nil
+	}
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 	return &UsmSecurityParameters{AuthoritativeEngineID: sp.AuthoritativeEngineID,
