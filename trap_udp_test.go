@@ -25,6 +25,10 @@ func skipWithoutIPv6Loopback(t *testing.T) {
 	c.Close()
 }
 
+func TestParseDstWithoutControlMessage(t *testing.T) {
+	require.Nil(t, parseDst(nil))
+}
+
 func TestReflectorUDPConn(t *testing.T) {
 	subs := []struct {
 		name                      string

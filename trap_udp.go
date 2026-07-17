@@ -44,6 +44,10 @@ func (c *reflectorUDPConn) readUDPFrom(b []byte) (int, *net.UDPAddr, func(b []by
 
 // parseDst extracts the local destination IP from ancillary data, returning nil when unavailable.
 func parseDst(oob []byte) net.IP {
+	if len(oob) == 0 {
+		return nil
+	}
+
 	// Try both families, ControlMessage.Parse quietly skips mismatched family messages, so we're checking for Dst.
 	// IfIndex is ignored on purpose, it breaks Src outright on MacOS and is incompatible with asymmetric routing.
 	var cm4 ipv4.ControlMessage

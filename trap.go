@@ -310,8 +310,7 @@ func (t *TrapListener) handleTrapMessage(msg []byte, remote *net.UDPAddr, respon
 	t.OnNewTrap(trap, remote)
 
 	// If it was an Inform request, we need to send a response.
-	if trap.PDUType == InformRequest { //nolint:whitespace
-
+	if trap.PDUType == InformRequest {
 		// Reuse the packet, since we're supposed to send it back
 		// with the exact same variables unless there's an error.
 		// Change the PDUType to the response, though.
