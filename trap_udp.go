@@ -11,60 +11,86 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
-// reflectorUDPConn is a net.UDPConn wrapper that records both source IP:port for incoming packets and local IP they
-// were received on, enabling correctly sourced responses on a multihomed host. When a platform lacks
-// PacketConn.SetControlMessage support, like Windows, it gracefully degrades to just remembering the source IP:port.
+// reflectorUDPConn is a net.UDPConn wrapper that records the local destination IP of incoming packets and uses it as
+// the source address of the corresponding response, so that responses from a multihomed host leave from the address
+// the request was sent to (RFC 1122 sections 3.3.4.2 and 4.1.3.5).
+//
+// Source selection requires ancillary packet-info support from golang.org/x/net. For IPv4 that is available on Linux,
+// macOS, Solaris and z/OS; for IPv6 also on the BSDs and AIX. Elsewhere (notably Windows, and IPv4 on the BSDs) the
+// wrapper degrades to ordinary kernel source selection. A destination that is not usable as a source (multicast,
+// broadcast) also falls back to ordinary kernel source selection.
 type reflectorUDPConn struct {
 	conn *net.UDPConn
 }
 
-var (
-	oobLen = max(len(ipv4.NewControlMessage(ipv4.FlagDst)), len(ipv6.NewControlMessage(ipv6.FlagDst)))
-)
-
 func newReflectorUDPConn(conn *net.UDPConn) *reflectorUDPConn {
-	c := &reflectorUDPConn{conn: conn}
-	// We don't know address family of conn, so try both and see what sticks. Windows will fail both.
+	// We don't know the address family of conn, so try both and see what sticks. Windows will fail both.
 	_ = ipv4.NewPacketConn(conn).SetControlMessage(ipv4.FlagDst, true)
 	_ = ipv6.NewPacketConn(conn).SetControlMessage(ipv6.FlagDst, true)
-	return c
+	return &reflectorUDPConn{conn: conn}
 }
 
-func (c *reflectorUDPConn) readUDPFrom(b []byte) (n int, src *net.UDPAddr, respond func(b []byte) (n int, err error), err error) {
-	oob := make([]byte, oobLen) // TODO: we could reuse a buffer if we can guarantee no concurrent accesses to readFrom
+// readUDPFrom reads a single packet into b and returns the packet length, the sender's address, and a function that
+// sends a response to the sender, sourced from the request's destination address when possible.
+func (c *reflectorUDPConn) readUDPFrom(b []byte) (int, *net.UDPAddr, func(b []byte) (int, error), error) {
+	oob := make([]byte, max(len(ipv4.NewControlMessage(ipv4.FlagDst)), len(ipv6.NewControlMessage(ipv6.FlagDst))))
 	n, oobn, _, src, err := c.conn.ReadMsgUDP(b, oob)
 	if err != nil {
-		return
+		return 0, nil, nil, err
 	}
-	oob = oob[:oobn]
 
+	return n, src, c.respondFunc(src, parseDst(oob[:oobn])), nil
+}
+
+// parseDst extracts the local destination IP from ancillary data, returning nil when unavailable.
+func parseDst(oob []byte) net.IP {
 	// Try both families, ControlMessage.Parse quietly skips mismatched family messages, so we're checking for Dst.
 	// IfIndex is ignored on purpose, it breaks Src outright on MacOS and is incompatible with asymmetric routing.
-	var dst net.IP
-	var cm4, cm6 = ipv4.ControlMessage{}, ipv6.ControlMessage{}
-	if err = cm4.Parse(oob); err == nil && cm4.Dst != nil {
-		dst = cm4.Dst
-	} else if err = cm6.Parse(oob); err == nil && cm6.Dst != nil {
-		dst = cm6.Dst
+	var cm4 ipv4.ControlMessage
+	if err := cm4.Parse(oob); err == nil && cm4.Dst != nil {
+		return cm4.Dst
+	}
+	var cm6 ipv6.ControlMessage
+	if err := cm6.Parse(oob); err == nil && cm6.Dst != nil {
+		return cm6.Dst
+	}
+	return nil
+}
+
+// respondFunc returns a function that sends a packet to src, sourced from dst when dst is usable as a source
+// address. Broadcast and multicast destinations are not valid response sources (RFC 1122 section 3.2.1.3 defines the
+// specific destination of such packets as a unicast address of the receiving interface), so they get ordinary kernel
+// source selection. Directed broadcast addresses cannot be recognized without interface data, so a failed
+// source-constrained write is retried without the source constraint rather than dropping the response, mirroring
+// Net-SNMP's fallback behavior.
+func (c *reflectorUDPConn) respondFunc(src *net.UDPAddr, dst net.IP) func(b []byte) (int, error) {
+	plain := func(b []byte) (int, error) { return c.conn.WriteToUDP(b, src) }
+
+	if dst == nil || dst.IsMulticast() || dst.IsUnspecified() || dst.Equal(net.IPv4bcast) {
+		return plain
 	}
 
 	// On a dual-stack host a wildcard socket will serve both IPv4 & IPv6 in IPv6 mode. A packet directed at a local
-	// IPv4 address will produce an ipv6.ControlMessage containing an 16-byte long IPv4 Dst. On the other hand,
+	// IPv4 address will produce an ipv6.ControlMessage containing a 16-byte long IPv4 Dst. On the other hand,
 	// ControlMessage.Marshal ignores Src with mismatched family, so here we are doing a bit of a repack.
-	if dst4 := dst.To4(); dst4 != nil {
+	var oob []byte
+	if dst.To4() != nil {
 		oob = (&ipv4.ControlMessage{Src: dst}).Marshal()
-	} else if dst6 := dst.To16(); dst6 != nil {
-		oob = (&ipv6.ControlMessage{Src: dst}).Marshal()
 	} else {
-		// Windows fallback
-		respond = func(b []byte) (int, error) { return c.conn.WriteToUDP(b, src) }
-		return
+		oob = (&ipv6.ControlMessage{Src: dst}).Marshal()
+	}
+	if len(oob) == 0 {
+		// The platform cannot marshal a source control message (e.g. IPv4 on the BSDs, or Windows).
+		return plain
 	}
 
-	respond = func(b []byte) (int, error) {
+	return func(b []byte) (int, error) {
 		n, _, err := c.conn.WriteMsgUDP(b, oob, src)
-		return n, err
+		if err != nil {
+			// dst was not usable as a source after all (e.g. a directed broadcast); retry with kernel
+			// source selection rather than dropping the response.
+			return plain(b)
+		}
+		return n, nil
 	}
-
-	return
 }
