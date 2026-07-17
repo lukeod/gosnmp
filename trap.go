@@ -277,10 +277,12 @@ func (t *TrapListener) handleTrapMessage(msg []byte, remote *net.UDPAddr, respon
 		securityParams, ok := t.Params.SecurityParameters.(*UsmSecurityParameters)
 		if !ok {
 			t.Params.Logger.Printf("TrapListener: Invalid SecurityParameters types")
+			return
 		}
 		packetSecurityParams, ok := trap.SecurityParameters.(*UsmSecurityParameters)
 		if !ok {
 			t.Params.Logger.Printf("TrapListener: Invalid SecurityParameters types")
+			return
 		}
 		snmpEngineID := securityParams.AuthoritativeEngineID
 		msgAuthoritativeEngineID := packetSecurityParams.AuthoritativeEngineID
@@ -291,7 +293,7 @@ func (t *TrapListener) handleTrapMessage(msg []byte, remote *net.UDPAddr, respon
 				// According to RFC3414 3.2.3b: stop processing and report
 				// the listener authoritative engine ID
 				atomic.AddUint32(&t.usmStatsUnknownEngineIDsCount, 1)
-				err := t.reportAuthoritativeEngineID(trap, snmpEngineID, respond)
+				err = t.reportAuthoritativeEngineID(trap, snmpEngineID, respond)
 				if err != nil {
 					t.Params.Logger.Printf("TrapListener: %s\n", err)
 				}
@@ -400,11 +402,11 @@ func (t *TrapListener) listenTCP(addr string) error {
 
 			// Listen for an incoming connection.
 			conn, err := l.Accept()
-			fmt.Printf("ACCEPT: %s", conn)
 			if err != nil {
-				fmt.Println("error accepting: ", err.Error())
+				t.Params.Logger.Printf("TrapListener: error in accept %s\n", err)
 				return err
 			}
+			t.Params.Logger.Printf("TrapListener: accepted connection from %v\n", conn.RemoteAddr())
 			// Handle connections in a new goroutine.
 			go t.handleTCPRequest(conn)
 		}
