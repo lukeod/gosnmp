@@ -75,9 +75,9 @@ func TestReflectorUDPConn(t *testing.T) {
 			t.Logf("CLIENT: bind %v real %v\n", clientAddr, client.LocalAddr())
 
 			payload := []byte("payload")
+			require.NoError(t, srv.SetDeadline(time.Now().Add(1*time.Second)))
 			srvErr := make(chan error, 1)
 			go func() {
-				require.NoError(t, srv.SetDeadline(time.Now().Add(1*time.Second)))
 				buf := make([]byte, 1024)
 				n, src, respond, err := r.readUDPFrom(buf)
 				if err != nil {
