@@ -515,10 +515,11 @@ func (packet *SnmpPacket) writeTo(writer func([]byte) (int, error)) error {
 	}
 
 	count, err := writer(b)
+	if err == nil && count != len(b) {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
 		return fmt.Errorf("error sending SnmpPacket: %w", err)
-	} else if count != len(b) { // This isn't fatal, but should be logged.
-		packet.Logger.Printf("Failed to send all bytes of SnmpPacket!\n")
 	}
 	return nil
 }
