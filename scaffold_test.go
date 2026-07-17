@@ -2,6 +2,8 @@
 // source code is governed by a BSD-style license that can be found in the
 // LICENSE file.
 
+//go:build all || helper || marshal || trap || end2end
+
 package gosnmp
 
 import (
