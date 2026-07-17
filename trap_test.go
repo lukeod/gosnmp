@@ -372,6 +372,107 @@ func TestSendInformBasic(t *testing.T) {
 	}
 }
 
+// listenTCPEphemeral reserves an ephemeral TCP port, starts tl on it, and returns the port. The reserving listener
+// is closed just before tl.Listen, so another process could grab the port in between; acceptable for a test.
+func listenTCPEphemeral(t *testing.T, tl *TrapListener) uint16 {
+	t.Helper()
+
+	l, err := net.Listen("tcp", net.JoinHostPort(trapTestAddress, "0"))
+	require.NoError(t, err)
+	port := uint16(l.Addr().(*net.TCPAddr).Port) //nolint:gosec
+	require.NoError(t, l.Close())
+
+	errch := make(chan error, 1)
+	go func() {
+		errch <- tl.Listen(fmt.Sprintf("tcp://%s", net.JoinHostPort(trapTestAddress, strconv.Itoa(int(port)))))
+	}()
+
+	select {
+	case <-tl.Listening():
+		return port
+	case err := <-errch:
+		t.Fatalf("error in listen: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for listener")
+	}
+	return 0
+}
+
+// test sending an SNMP inform over TCP and receiving the response on the same connection
+func TestSendInformTCP(t *testing.T) {
+	done := make(chan error, 1)
+
+	tl := NewTrapListener()
+	defer tl.Close()
+	tl.OnNewTrap = makeTestTrapHandler(done, Version2c)
+	tl.Params = newTestGoSNMP()
+
+	gs := newTestGoSNMP()
+	gs.Transport = "tcp"
+	gs.Target = trapTestAddress
+	gs.Port = listenTCPEphemeral(t, tl)
+
+	require.NoError(t, gs.Connect())
+	defer gs.Conn.Close()
+
+	trap := SnmpTrap{
+		Variables: []SnmpPDU{{Name: trapTestOid, Type: OctetString, Value: trapTestPayload}},
+		IsInform:  true,
+	}
+
+	resp, err := gs.SendTrap(trap)
+	require.NoError(t, err)
+
+	waitForTestTrap(t, done)
+
+	require.Equal(t, GetResponse, resp.PDUType)
+}
+
+// test SNMPv3 engine ID discovery over TCP: the Report must come back on the same connection
+func TestSendV3EngineIdDiscoveryTCP(t *testing.T) {
+	tl := NewTrapListener()
+	defer tl.Close()
+	authoritativeEngineID := string([]byte{0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04})
+	unknownEngineID := string([]byte{0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x05})
+	sp := &UsmSecurityParameters{
+		UserName:                 "test",
+		AuthenticationProtocol:   SHA,
+		AuthenticationPassphrase: "password",
+		PrivacyProtocol:          AES256,
+		PrivacyPassphrase:        "password",
+		AuthoritativeEngineBoots: 1,
+		AuthoritativeEngineTime:  1,
+		AuthoritativeEngineID:    authoritativeEngineID,
+	}
+	tl.Params = newTestGoSNMPv3(AuthPriv, sp)
+
+	clientParams := sp.Copy()
+	clientParams.(*UsmSecurityParameters).AuthoritativeEngineID = ""
+	gs := newTestGoSNMPv3(AuthPriv, clientParams)
+	gs.Transport = "tcp"
+	gs.Target = trapTestAddress
+	gs.Port = listenTCPEphemeral(t, tl)
+	require.NoError(t, gs.Connect())
+	defer gs.Conn.Close()
+
+	getEngineIDRequest := SnmpPacket{
+		Version:            Version3,
+		MsgFlags:           Reportable,
+		SecurityModel:      UserSecurityModel,
+		SecurityParameters: &UsmSecurityParameters{},
+		ContextEngineID:    unknownEngineID,
+		PDUType:            GetRequest,
+		MsgID:              1824792385,
+		RequestID:          1411852680,
+		MsgMaxSize:         65507,
+	}
+	result, err := gs.sendOneRequest(&getEngineIDRequest, true)
+	require.NoError(t, err, "sendOneRequest failed")
+
+	require.Equal(t, authoritativeEngineID, result.SecurityParameters.(*UsmSecurityParameters).AuthoritativeEngineID)
+	require.Equal(t, Report, result.PDUType)
+}
+
 // test the listener is not blocked if Listening is not used
 func TestSendTrapWithoutWaitingOnListen(t *testing.T) {
 	done := make(chan error, 1)
