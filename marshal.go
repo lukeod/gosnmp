@@ -289,7 +289,6 @@ sendRetry:
 			return &SnmpPacket{}, nil
 		}
 
-	waitingResponse:
 		for {
 			x.Logger.Print("WAITING RESPONSE...")
 			// Receive response and try receiving again on any decoding error.
@@ -322,8 +321,13 @@ sendRetry:
 
 			var cursor int
 			cursor, err = x.unmarshalHeader(resp, result)
+			differentEngine := packetOut.Version == Version3 && result.Version == Version3 &&
+				engineIDChanged(packetOut.SecurityParameters, result.SecurityParameters)
 			if err != nil {
 				x.Logger.Printf("ERROR on unmarshall header: %s", err)
+				if differentEngine {
+					continue
+				}
 				break
 			}
 
@@ -350,31 +354,32 @@ sendRetry:
 					x.Logger.Print("ERROR v3 message with privacy but no authentication discarded")
 					continue
 				}
-				useResponseSecurityParameters := false
 				if usp, ok := x.SecurityParameters.(*UsmSecurityParameters); ok {
 					if usp.AuthoritativeEngineID == "" {
 						established = false
-						useResponseSecurityParameters = true
-						// Until the engine ID is known, testAuthentication trusts
-						// the response's own msgFlags, so only an engine discovery
-						// Report may arrive below the configured security level.
+						// Only a discovery Report may arrive below the configured
+						// security level while the engine ID is unknown.
 						unauthenticated = usp.checkAuthenticated(result.MsgFlags) != nil
 					}
 				}
-				if established && receivedLevel&AuthNoPriv == 0 {
-					// Nothing to verify. Only a Report may arrive below the
-					// request's security level (step 11), and it is not trusted.
-					unauthenticated = requestLevel&AuthNoPriv != 0
-				} else {
-					err = x.testAuthentication(resp, result, useResponseSecurityParameters)
+				if receivedLevel&AuthNoPriv != 0 {
+					err = authenticateV3Message(resp, result, packetOut.SecurityParameters)
 					if err != nil {
 						x.Logger.Printf("ERROR on Test Authentication on v3: %s", err)
+						if differentEngine {
+							continue
+						}
 						break
 					}
+				} else if established {
+					unauthenticated = requestLevel&AuthNoPriv != 0
 				}
 				resp, cursor, err = x.decryptPacket(resp, cursor, result)
 				if err != nil {
 					x.Logger.Printf("ERROR on decryptPacket on v3: %s", err)
+					if differentEngine {
+						continue
+					}
 					break
 				}
 			}
@@ -382,6 +387,9 @@ sendRetry:
 			err = x.unmarshalPayload(resp, cursor, result)
 			if err != nil {
 				x.Logger.Printf("ERROR on UnmarshalPayload on v3: %s", err)
+				if differentEngine {
+					continue
+				}
 				break
 			}
 			if unauthenticated && result.PDUType != Report {
@@ -390,7 +398,7 @@ sendRetry:
 			}
 			// RFC 3412 section 7.2 step 12: a response must come from the
 			// engine the request was sent to.
-			if result.PDUType != Report && x.engineIDChanged(result) {
+			if result.PDUType != Report && differentEngine {
 				x.Logger.Printf("ERROR %s from a different authoritative engine discarded", result.PDUType)
 				continue
 			}
@@ -401,72 +409,28 @@ sendRetry:
 					result.PDUType, receivedLevel, requestLevel)
 				continue
 			}
+			if reportErr := result.reportError(); reportErr != nil {
+				if reportErr == ErrNotInTimeWindow || reportErr == ErrUnknownEngineID {
+					if differentEngine {
+						return result, fmt.Errorf("%w: report is from a different authoritative engine than the request's", ErrUnknownEngineID)
+					}
+					// Allow the caller to use the reported engine parameters for
+					// discovery or recovery at the session's authentication level.
+					if !established || !unauthenticated {
+						break
+					}
+				}
+				return result, reportErr
+			}
 			if result.Error == NoError && len(result.Variables) < 1 {
 				x.Logger.Printf("ERROR on UnmarshalPayload on v3: Empty result")
 				break
 			}
 
-			// While Report PDU was defined by RFC 1905 as part of SNMPv2, it was never
-			// used until SNMPv3. Report PDU's allow a SNMP engine to tell another SNMP
-			// engine that an error was detected while processing an SNMP message.
-			//
-			// The format for a Report PDU is
-			// -----------------------------------
-			// | 0xA8 | reqid | 0 | 0 | varbinds |
-			// -----------------------------------
-			// where:
-			// - PDU type 0xA8 indicates a Report PDU.
-			// - reqid is either:
-			//    The request identifier of the message that triggered the report
-			//    or zero if the request identifier cannot be extracted.
-			// - The variable bindings will contain a single object identifier and its value
-			//
-			// usmStatsNotInTimeWindows and usmStatsUnknownEngineIDs are recoverable errors
-			// and will be retransmitted, for others we return the result with an error.
-			if result.Version == Version3 && result.PDUType == Report && len(result.Variables) == 1 {
-				switch result.Variables[0].Name {
-				case usmStatsUnsupportedSecLevels:
-					return result, ErrUnknownSecurityLevel
-				case usmStatsNotInTimeWindows:
-					if unauthenticated && established {
-						// Its engine boots and time are not authenticated, so
-						// don't resend with them.
-						return result, ErrNotInTimeWindow
-					}
-					break waitingResponse
-				case usmStatsUnknownUserNames:
-					return result, ErrUnknownUsername
-				case usmStatsUnknownEngineIDs:
-					if unauthenticated && established {
-						return result, ErrUnknownEngineID
-					}
-					break waitingResponse
-				case usmStatsWrongDigests:
-					return result, ErrWrongDigest
-				case usmStatsDecryptionErrors:
-					return result, ErrDecryption
-				case snmpUnknownSecurityModels:
-					return result, ErrUnknownSecurityModels
-				case snmpInvalidMsgs:
-					return result, ErrInvalidMsgs
-				case snmpUnknownPDUHandlers:
-					return result, ErrUnknownPDUHandlers
-				default:
-					return result, ErrUnknownReportPDU
-				}
-			}
-			if unauthenticated && established {
-				// A Report that can't be classified above would be returned
-				// and its security parameters stored.
-				x.Logger.Printf("ERROR unauthenticated %s discarded", result.PDUType)
-				continue
-			}
-
-			// A v3 REPORT is matched by msgID alone, checked above. Otherwise the
-			// request-id must be exactly one we sent (0 included, as the counter
-			// wraps) and, for v3, sent on the same attempt as the msgID
-			// (RFC 3413 3.1).
-			validID := x.Version == Version3 && result.PDUType == Report
+			// Reports are matched by msgID alone above. For other replies,
+			// request-id must be one we sent (including 0 if the counter wraps)
+			// and, for v3, from the same attempt as msgID (RFC 3413 3.1).
+			validID := false
 			for _, attempt := range attempts {
 				if attempt.requestID == result.RequestID && (x.Version != Version3 || attempt.msgID == result.MsgID) {
 					validID = true
@@ -493,6 +457,38 @@ sendRetry:
 
 	// Return last error
 	return nil, err
+}
+
+// reportError classifies the single varbind of an SNMPv3 Report.
+func (packet *SnmpPacket) reportError() error {
+	if packet.Version != Version3 || packet.PDUType != Report {
+		return nil
+	}
+	if len(packet.Variables) != 1 {
+		return ErrUnknownReportPDU
+	}
+	switch packet.Variables[0].Name {
+	case usmStatsUnsupportedSecLevels:
+		return ErrUnknownSecurityLevel
+	case usmStatsNotInTimeWindows:
+		return ErrNotInTimeWindow
+	case usmStatsUnknownUserNames:
+		return ErrUnknownUsername
+	case usmStatsUnknownEngineIDs:
+		return ErrUnknownEngineID
+	case usmStatsWrongDigests:
+		return ErrWrongDigest
+	case usmStatsDecryptionErrors:
+		return ErrDecryption
+	case snmpUnknownSecurityModels:
+		return ErrUnknownSecurityModels
+	case snmpInvalidMsgs:
+		return ErrInvalidMsgs
+	case snmpUnknownPDUHandlers:
+		return ErrUnknownPDUHandlers
+	default:
+		return ErrUnknownReportPDU
+	}
 }
 
 // generic "sender" that negotiate any version of snmp request
@@ -531,45 +527,30 @@ func (x *GoSNMP) send(packetOut *SnmpPacket, wait bool) (result *SnmpPacket, err
 		return result, err
 	}
 
-	if result.Version == Version3 {
-		x.Logger.Printf("SEND STORE SECURITY PARAMS from result: %s", result.SecurityParameters.SafeString())
-		if err = x.storeSecurityParameters(result); err != nil {
-			// Don't resend after a Report whose parameters weren't stored,
-			// for example one from a different engine than the session's.
-			return result, err
-		}
-
-		if result.PDUType == Report && len(result.Variables) == 1 {
-			switch result.Variables[0].Name {
-			case usmStatsNotInTimeWindows:
-				x.Logger.Print("WARNING detected out-of-time-window ERROR")
-				if err = x.updatePktSecurityParameters(packetOut); err != nil {
-					x.Logger.Printf("ERROR updatePktSecurityParameters error: %s", err)
-					return nil, err
-				}
-				// retransmit with updated auth engine params
-				result, err = x.sendOneRequest(packetOut, wait)
-				if err != nil {
-					x.Logger.Printf("ERROR out-of-time-window retransmit error: %s", err)
-					return result, ErrNotInTimeWindow
-				}
-
-			case usmStatsUnknownEngineIDs:
-				x.Logger.Print("WARNING detected unknown engine id ERROR")
-				if err = x.updatePktSecurityParameters(packetOut); err != nil {
-					x.Logger.Printf("ERROR updatePktSecurityParameters error: %s", err)
-					return nil, err
-				}
-				// retransmit with updated engine id
-				result, err = x.sendOneRequest(packetOut, wait)
-				if err != nil {
-					x.Logger.Printf("ERROR unknown engine id retransmit error: %s", err)
-					return result, ErrUnknownEngineID
-				}
-			}
-		}
+	if result.Version != Version3 {
+		return result, nil
 	}
-	return result, err
+	x.Logger.Printf("SEND STORE SECURITY PARAMS from result: %s", result.SecurityParameters.SafeString())
+	if err = x.storeSecurityParameters(result); err != nil {
+		return result, err
+	}
+	if result.PDUType != Report {
+		return result, nil
+	}
+
+	// sendOneRequest only returns a Report with nil error when its engine
+	// parameters can be used for recovery. Allow one recovery exchange.
+	if err = x.updatePktSecurityParameters(packetOut); err != nil {
+		return nil, err
+	}
+	result, err = x.sendOneRequest(packetOut, wait)
+	if err != nil {
+		return result, err
+	}
+	if err = result.reportError(); err != nil {
+		return result, err
+	}
+	return result, x.storeSecurityParameters(result)
 }
 
 // -- Marshalling Logic --------------------------------------------------------

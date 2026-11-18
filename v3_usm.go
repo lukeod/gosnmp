@@ -289,17 +289,26 @@ func (sp *UsmSecurityParameters) InitSecurityKeys() error {
 }
 
 func (sp *UsmSecurityParameters) initSecurityKeysNoLock() error {
-	var err error
+	if err := sp.initAuthenticationKey(); err != nil {
+		return err
+	}
+	return sp.initPrivacyKey()
+}
 
+func (sp *UsmSecurityParameters) initAuthenticationKey() error {
 	if sp.AuthenticationProtocol > NoAuth && len(sp.SecretKey) == 0 {
+		var err error
 		sp.SecretKey, err = genlocalkey(sp.AuthenticationProtocol,
 			sp.AuthenticationPassphrase,
 			sp.AuthoritativeEngineID)
-		if err != nil {
-			return err
-		}
+		return err
 	}
+	return nil
+}
+
+func (sp *UsmSecurityParameters) initPrivacyKey() error {
 	if sp.PrivacyProtocol > NoPriv && len(sp.PrivacyKey) == 0 {
+		var err error
 		switch sp.PrivacyProtocol {
 		// Changed: The Output of SHA1 is a 20 octets array, therefore for AES128 (16 octets) either key extension algorithm can be used.
 		case AES, AES192, AES256, AES192C, AES256C:
@@ -307,17 +316,12 @@ func (sp *UsmSecurityParameters) initSecurityKeysNoLock() error {
 			sp.PrivacyKey, err = genlocalPrivKey(sp.PrivacyProtocol, sp.AuthenticationProtocol,
 				sp.PrivacyPassphrase,
 				sp.AuthoritativeEngineID)
-			if err != nil {
-				return err
-			}
 		default:
 			sp.PrivacyKey, err = genlocalkey(sp.AuthenticationProtocol,
 				sp.PrivacyPassphrase,
 				sp.AuthoritativeEngineID)
-			if err != nil {
-				return err
-			}
 		}
+		return err
 	}
 	return nil
 }
@@ -338,8 +342,7 @@ func (sp *UsmSecurityParameters) setSecurityParameters(in SnmpV3SecurityParamete
 		sp.SecretKey = nil
 		sp.PrivacyKey = nil
 
-		err = sp.initSecurityKeysNoLock()
-		if err != nil {
+		if err = sp.initSecurityKeysNoLock(); err != nil {
 			return err
 		}
 	}
@@ -706,6 +709,9 @@ func (sp *UsmSecurityParameters) calcPacketDigest(packet []byte) ([]byte, error)
 // INFORM).
 // Support MD5, SHA1, SHA224, SHA256, SHA384, SHA512 protocols
 func calcPacketDigest(packetBytes []byte, secParams *UsmSecurityParameters) ([]byte, error) {
+	if err := secParams.initAuthenticationKey(); err != nil {
+		return nil, err
+	}
 	var digest []byte
 	var err error
 
@@ -837,6 +843,9 @@ func (sp *UsmSecurityParameters) isAuthentic(packetBytes []byte, packet *SnmpPac
 }
 
 func (sp *UsmSecurityParameters) encryptPacket(scopedPdu []byte) ([]byte, error) {
+	if err := sp.initPrivacyKey(); err != nil {
+		return nil, err
+	}
 	var b []byte
 
 	switch sp.PrivacyProtocol {
@@ -896,6 +905,9 @@ func (sp *UsmSecurityParameters) decryptPacket(packet []byte, cursor int) ([]byt
 	cursorTmp += cursor
 	if cursorTmp > len(packet) {
 		return nil, errors.New("error decrypting ScopedPDU: truncated packet")
+	}
+	if err = sp.initPrivacyKey(); err != nil {
+		return nil, err
 	}
 
 	switch sp.PrivacyProtocol {
@@ -1032,14 +1044,12 @@ func (sp *UsmSecurityParameters) unmarshal(flags SnmpV3MsgFlags, packet []byte, 
 	if AuthoritativeEngineID, ok := rawMsgAuthoritativeEngineID.(string); ok {
 		if sp.AuthoritativeEngineID != AuthoritativeEngineID {
 			sp.AuthoritativeEngineID = AuthoritativeEngineID
+			// These keys belong to the previous engine. Derive new ones
+			// only if the message needs authentication or decryption.
 			sp.SecretKey = nil
 			sp.PrivacyKey = nil
 
 			sp.Logger.Printf("Parsed authoritativeEngineID %0x", []byte(AuthoritativeEngineID))
-			err = sp.initSecurityKeysNoLock()
-			if err != nil {
-				return 0, err
-			}
 		}
 	}
 

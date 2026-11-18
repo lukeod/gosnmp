@@ -784,85 +784,185 @@ func TestV3HarnessTCPFraming(t *testing.T) {
 	}
 }
 
-// The tests below check that once a session has an authoritative engine ID,
-// responses cannot replace it: only initial discovery adopts an engine ID.
-// Each agent answers as a different engine than the one the session has
-// established, as after a reboot that generates a new engine ID or from
-// another engine sharing the same credentials.
-
 var v3OtherEngineID = string([]byte{0x80, 0x00, 0x1f, 0x88, 0x04, 'r', 'e', 'b', 'o', 'o', 't', 'e', 'd'})
 
-func v3EngineIDSeedSession(sp *UsmSecurityParameters) {
+func v3SeedEstablishedSession(sp *UsmSecurityParameters) {
 	sp.AuthoritativeEngineID = v3HarnessEngineID
 	sp.AuthoritativeEngineBoots = v3HarnessBoots
 	sp.AuthoritativeEngineTime = v3HarnessTime
 }
 
-// TestV3EngineIDNoAuthResponseKeepsIdentity checks that a noAuthNoPriv
-// response from another engine is discarded rather than returned, and leaves
-// the session's engine ID alone.
-func TestV3EngineIDNoAuthResponseKeepsIdentity(t *testing.T) {
-	agent := newV3TestAgent(t, v3OtherEngineID, v3HarnessBoots, v3HarnessTime, v3TestAgentCreds{username: v3HarnessUser})
-	agent.steps = []v3TestAgentStep{v3AgentSysDescr(agent)}
-	port := agent.startUDP(t)
-
-	gs, sp := newV3HarnessClient(port, NoAuthNoPriv, agent.creds)
-	v3EngineIDSeedSession(sp)
-	v3HarnessConnect(t, gs)
-
-	result, err := gs.Get([]string{v3HarnessSysDescrOID})
-	require.Error(t, err)
-	require.Nil(t, result)
-	require.Equal(t, v3HarnessEngineID, sp.AuthoritativeEngineID)
-	requireRequestCount(t, agent, 1)
-}
-
-// TestV3EngineIDSignedResponseKeepsIdentity checks that a response signed
-// with the user's key localized to another engine ID does not replace the
-// established identity. Receive-side parsing relocalizes the copied keys to
-// the response's engine ID, so the HMAC itself verifies.
-func TestV3EngineIDSignedResponseKeepsIdentity(t *testing.T) {
-	agent := newV3TestAgent(t, v3OtherEngineID, v3HarnessBoots, v3HarnessTime, v3HarnessCredsAuthNoPriv())
-	agent.steps = []v3TestAgentStep{v3AgentSysDescr(agent)}
-	port := agent.startUDP(t)
-
-	gs, sp := newV3HarnessClient(port, AuthNoPriv, agent.creds)
-	v3EngineIDSeedSession(sp)
-	v3HarnessConnect(t, gs)
-
-	result, err := gs.Get([]string{v3HarnessSysDescrOID})
-	require.Error(t, err)
-	require.Nil(t, result)
-	require.Equal(t, v3HarnessEngineID, sp.AuthoritativeEngineID)
-	requireRequestCount(t, agent, 1)
-}
-
-// TestV3EngineIDChangedReportIsAnError checks that an authenticated
-// usmStatsUnknownEngineIDs Report naming another engine comes back as
-// ErrUnknownEngineID, without adopting that engine ID or resending to it,
-// so the caller can decide whether to rediscover.
-func TestV3EngineIDChangedReportIsAnError(t *testing.T) {
-	agent := newV3TestAgent(t, v3OtherEngineID, v3HarnessBoots, v3HarnessTime, v3HarnessCredsAuthNoPriv())
-	agent.steps = []v3TestAgentStep{
-		func(req *v3TestAgentRequest) [][]byte {
-			return agent.reply(req, v3TestAgentReply{
-				pduType: Report,
-				vars:    []SnmpPDU{{Name: usmStatsUnknownEngineIDs, Type: Counter32, Value: uint32(1)}},
-			})
-		},
-		// Only reached if the client adopts the new engine ID and resends.
-		v3AgentSysDescr(agent),
+// Both replies belong to the same attempt. The client should finish the
+// original GET even if it cannot authenticate the different-engine reply.
+func TestV3EngineIDDiscardsResponseAndKeepsWaiting(t *testing.T) {
+	tests := []struct {
+		name          string
+		level         SnmpV3MsgFlags
+		creds         v3TestAgentCreds
+		otherAuthPass string
+		localizedKeys bool
+	}{
+		{name: "noAuthNoPriv", level: NoAuthNoPriv, creds: v3TestAgentCreds{username: v3HarnessUser}},
+		{name: "authNoPriv", level: AuthNoPriv, creds: v3HarnessCredsAuthNoPriv()},
+		{name: "authPriv", level: AuthPriv, creds: v3HarnessCredsAuthPriv()},
+		{name: "different auth passphrase", level: AuthNoPriv, creds: v3HarnessCredsAuthNoPriv(), otherAuthPass: "other-auth-pass"},
+		{name: "localized keys", level: AuthPriv, creds: v3HarnessCredsAuthPriv(), localizedKeys: true},
 	}
-	port := agent.startUDP(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := newV3TestAgent(t, v3HarnessEngineID, v3HarnessBoots, v3HarnessTime, tt.creds)
+			otherCreds := tt.creds
+			if tt.otherAuthPass != "" {
+				otherCreds.authPass = tt.otherAuthPass
+			}
+			other := newV3TestAgent(t, v3OtherEngineID, v3HarnessBoots+1, v3HarnessTime+10, otherCreds)
+			agent.steps = []v3TestAgentStep{func(req *v3TestAgentRequest) [][]byte {
+				return append(v3AgentSysDescr(other)(req), v3AgentSysDescr(agent)(req)...)
+			}}
+			port := agent.startUDP(t)
 
-	gs, sp := newV3HarnessClient(port, AuthNoPriv, agent.creds)
-	v3EngineIDSeedSession(sp)
-	v3HarnessConnect(t, gs)
+			gs, sp := newV3HarnessClient(port, tt.level, tt.creds)
+			v3SeedEstablishedSession(sp)
+			require.NoError(t, sp.InitSecurityKeys())
+			secretKey, privacyKey := bytes.Clone(sp.SecretKey), bytes.Clone(sp.PrivacyKey)
+			if tt.localizedKeys {
+				sp.AuthenticationPassphrase = ""
+				sp.PrivacyPassphrase = ""
+			}
+			v3HarnessConnect(t, gs)
 
-	_, err := gs.Get([]string{v3HarnessSysDescrOID})
-	require.ErrorIs(t, err, ErrUnknownEngineID)
-	require.Equal(t, v3HarnessEngineID, sp.AuthoritativeEngineID)
-	requireRequestCount(t, agent, 1)
+			result, err := gs.Get([]string{v3HarnessSysDescrOID})
+			require.NoError(t, err)
+			requireSysDescrResult(t, result)
+			require.Equal(t, v3HarnessEngineID, result.SecurityParameters.(*UsmSecurityParameters).AuthoritativeEngineID)
+			require.Equal(t, v3HarnessEngineID, sp.AuthoritativeEngineID)
+			require.Equal(t, v3HarnessBoots, sp.AuthoritativeEngineBoots)
+			require.Equal(t, v3HarnessTime, sp.AuthoritativeEngineTime)
+			require.Equal(t, secretKey, sp.SecretKey)
+			require.Equal(t, privacyKey, sp.PrivacyKey)
+			requireRequestCount(t, agent, 1)
+		})
+	}
+}
+
+func v3AgentUSMReport(agent *v3TestAgent, oid string, level SnmpV3MsgFlags) v3TestAgentStep {
+	return func(req *v3TestAgentRequest) [][]byte {
+		var requestID uint32 // an agent can report with request-id 0 and the matching msgID
+		return agent.reply(req, v3TestAgentReply{
+			pduType:   Report,
+			vars:      []SnmpPDU{{Name: oid, Type: Counter32, Value: uint32(1)}},
+			requestID: &requestID,
+			msgFlags:  &level,
+		})
+	}
+}
+
+func TestV3EngineIDChangedReportIsAnError(t *testing.T) {
+	tests := []struct {
+		name          string
+		oid           string
+		reportLevel   SnmpV3MsgFlags
+		localizedAuth bool
+		localizedPriv bool
+	}{
+		{name: "signed unknown engine", oid: usmStatsUnknownEngineIDs, reportLevel: AuthNoPriv},
+		{name: "unsigned unknown engine", oid: usmStatsUnknownEngineIDs, reportLevel: NoAuthNoPriv},
+		{name: "unsigned unknown engine with localized keys", oid: usmStatsUnknownEngineIDs, reportLevel: NoAuthNoPriv, localizedAuth: true, localizedPriv: true},
+		{name: "signed time window", oid: usmStatsNotInTimeWindows, reportLevel: AuthNoPriv},
+		{name: "signed time window with localized privacy key", oid: usmStatsNotInTimeWindows, reportLevel: AuthNoPriv, localizedPriv: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			creds := v3HarnessCredsAuthPriv()
+			agent := newV3TestAgent(t, v3HarnessEngineID, v3HarnessBoots, v3HarnessTime, creds)
+			other := newV3TestAgent(t, v3OtherEngineID, v3HarnessBoots+1, v3HarnessTime+10, creds)
+			agent.steps = []v3TestAgentStep{v3AgentUSMReport(other, tt.oid, tt.reportLevel)}
+			port := agent.startUDP(t)
+
+			gs, sp := newV3HarnessClient(port, AuthPriv, creds)
+			v3SeedEstablishedSession(sp)
+			gs.ContextEngineID = v3HarnessEngineID
+			require.NoError(t, sp.InitSecurityKeys())
+			secretKey, privacyKey := bytes.Clone(sp.SecretKey), bytes.Clone(sp.PrivacyKey)
+			if tt.localizedAuth {
+				sp.AuthenticationPassphrase = ""
+			}
+			if tt.localizedPriv {
+				sp.PrivacyPassphrase = ""
+			}
+			v3HarnessConnect(t, gs)
+			gs.SetRequestID(0)
+
+			result, err := gs.Get([]string{v3HarnessSysDescrOID})
+			require.ErrorIs(t, err, ErrUnknownEngineID)
+			require.NotNil(t, result)
+			require.Equal(t, Report, result.PDUType)
+			require.Equal(t, tt.reportLevel, result.MsgFlags)
+			require.NotZero(t, agent.request(0).Packet.RequestID)
+			require.Zero(t, result.RequestID)
+			require.Equal(t, agent.request(0).Packet.MsgID, result.MsgID)
+			require.Equal(t, v3HarnessEngineID, sp.AuthoritativeEngineID)
+			require.Equal(t, v3HarnessBoots, sp.AuthoritativeEngineBoots)
+			require.Equal(t, v3HarnessTime, sp.AuthoritativeEngineTime)
+			require.Equal(t, v3HarnessEngineID, gs.ContextEngineID)
+			require.Equal(t, secretKey, sp.SecretKey)
+			require.Equal(t, privacyKey, sp.PrivacyKey)
+			requireRequestCount(t, agent, 1)
+		})
+	}
+}
+
+func TestV3RecoveryResendClassifiesReport(t *testing.T) {
+	tests := []struct {
+		name        string
+		firstOID    string
+		secondOID   string
+		otherEngine bool
+		secondLevel SnmpV3MsgFlags
+		wantErr     error
+	}{
+		{"repeated time window", usmStatsNotInTimeWindows, usmStatsNotInTimeWindows, false, AuthNoPriv, ErrNotInTimeWindow},
+		{"repeated unknown engine", usmStatsUnknownEngineIDs, usmStatsUnknownEngineIDs, false, AuthNoPriv, ErrUnknownEngineID},
+		{"signed engine change", usmStatsNotInTimeWindows, usmStatsUnknownEngineIDs, true, AuthNoPriv, ErrUnknownEngineID},
+		{"unsigned engine change", usmStatsNotInTimeWindows, usmStatsUnknownEngineIDs, true, NoAuthNoPriv, ErrUnknownEngineID},
+		{"foreign time window", usmStatsNotInTimeWindows, usmStatsNotInTimeWindows, true, AuthNoPriv, ErrUnknownEngineID},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			creds := v3HarnessCredsAuthNoPriv()
+			agent := newV3TestAgent(t, v3HarnessEngineID, v3HarnessBoots, v3HarnessTime, creds)
+			secondEngineID := v3HarnessEngineID
+			if tt.otherEngine {
+				secondEngineID = v3OtherEngineID
+			}
+			second := newV3TestAgent(t, secondEngineID, v3HarnessBoots+1, v3HarnessTime+10, creds)
+			agent.steps = []v3TestAgentStep{
+				v3AgentUSMReport(agent, tt.firstOID, AuthNoPriv),
+				v3AgentUSMReport(second, tt.secondOID, tt.secondLevel),
+			}
+			port := agent.startUDP(t)
+
+			gs, sp := newV3HarnessClient(port, AuthNoPriv, creds)
+			v3SeedEstablishedSession(sp)
+			sp.AuthoritativeEngineBoots--
+			v3HarnessConnect(t, gs)
+
+			result, err := gs.Get([]string{v3HarnessSysDescrOID})
+			require.ErrorIs(t, err, tt.wantErr)
+			require.NotNil(t, result)
+			require.Equal(t, Report, result.PDUType)
+			require.Len(t, result.Variables, 1)
+			require.Equal(t, tt.secondOID, result.Variables[0].Name)
+			requireRequestCount(t, agent, 2)
+			resend := agent.request(1)
+			require.NotEqual(t, agent.request(0).Packet.MsgID, resend.Packet.MsgID)
+			require.Equal(t, v3HarnessEngineID, v3ReqSecParams(t, resend).AuthoritativeEngineID)
+			require.Equal(t, v3HarnessBoots, v3ReqSecParams(t, resend).AuthoritativeEngineBoots)
+			require.Equal(t, v3HarnessEngineID, sp.AuthoritativeEngineID)
+			require.Equal(t, v3HarnessBoots, sp.AuthoritativeEngineBoots)
+			require.Equal(t, v3HarnessTime, sp.AuthoritativeEngineTime)
+		})
+	}
 }
 
 // The tests below check that an established session takes the security
@@ -889,12 +989,6 @@ func setV3MsgFlags(t *testing.T, msg []byte, flags SnmpV3MsgFlags) []byte {
 	return nil
 }
 
-func v3SeclevelSeedSession(sp *UsmSecurityParameters) {
-	sp.AuthoritativeEngineID = v3HarnessEngineID
-	sp.AuthoritativeEngineBoots = v3HarnessBoots
-	sp.AuthoritativeEngineTime = v3HarnessTime
-}
-
 // TestV3SeclevelUnauthenticatedReportIsClassified checks that a noAuthNoPriv
 // usmStatsNotInTimeWindows Report on an authenticated session is classified
 // instead of failing HMAC verification, and that its unauthenticated engine
@@ -916,7 +1010,7 @@ func TestV3SeclevelUnauthenticatedReportIsClassified(t *testing.T) {
 	port := agent.startUDP(t)
 
 	gs, sp := newV3HarnessClient(port, AuthNoPriv, agent.creds)
-	v3SeclevelSeedSession(sp)
+	v3SeedEstablishedSession(sp)
 	v3HarnessConnect(t, gs)
 
 	_, err := gs.Get([]string{v3HarnessSysDescrOID})
@@ -941,7 +1035,7 @@ func TestV3SeclevelAuthPrivRejectsAuthNoPrivResponse(t *testing.T) {
 	port := agent.startUDP(t)
 
 	gs, sp := newV3HarnessClient(port, AuthPriv, agent.creds)
-	v3SeclevelSeedSession(sp)
+	v3SeedEstablishedSession(sp)
 	v3HarnessConnect(t, gs)
 
 	result, err := gs.Get([]string{v3HarnessSysDescrOID})
@@ -965,7 +1059,7 @@ func TestV3SeclevelRejectsPrivWithoutAuth(t *testing.T) {
 	port := agent.startUDP(t)
 
 	gs, sp := newV3HarnessClient(port, NoAuthNoPriv, agent.creds)
-	v3SeclevelSeedSession(sp)
+	v3SeedEstablishedSession(sp)
 	v3HarnessConnect(t, gs)
 
 	result, err := gs.Get([]string{v3HarnessSysDescrOID})

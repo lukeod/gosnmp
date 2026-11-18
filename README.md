@@ -138,6 +138,16 @@ Running this example gives the following output (from my printer):
 * `examples/example3.go` demonstrates `SNMPv3`
 * `examples/trapserver.go` demonstrates writing an SNMP v2c trap server
 
+## Rediscovering an SNMPv3 engine
+
+If an established session returns `ErrUnknownEngineID` after an agent changes
+its authoritative engine ID, use a new `GoSNMP` session with fresh
+`UsmSecurityParameters` to discover the agent again. With passphrase-based
+credentials, you can also clear `AuthoritativeEngineID` and any learned
+`ContextEngineID` before issuing another request on the existing session.
+Preserve an explicitly configured `ContextEngineID`. If you supply localized
+keys directly, configure the new engine ID and its corresponding keys.
+
 # MIB Parser
 
 I don't have any plans to write a mib parser. Others have suggested

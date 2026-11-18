@@ -127,26 +127,26 @@ func (x *GoSNMP) testAuthentication(packet []byte, result *SnmpPacket, useRespon
 		return fmt.Errorf("testAuthentication called with non Version3 connection")
 	}
 	msgFlags := x.MsgFlags
+	securityParameters := x.SecurityParameters
 	if useResponseSecurityParameters {
 		msgFlags = result.MsgFlags
+		securityParameters = result.SecurityParameters
 	}
 
 	if msgFlags&AuthNoPriv > 0 {
-		var authentic bool
-		var err error
-		if useResponseSecurityParameters {
-			authentic, err = result.SecurityParameters.isAuthentic(packet, result)
-		} else {
-			authentic, err = x.SecurityParameters.isAuthentic(packet, result)
-		}
-		if err != nil {
-			return err
-		}
-		if !authentic {
-			return fmt.Errorf("incoming packet is not authentic, discarding")
-		}
+		return authenticateV3Message(packet, result, securityParameters)
 	}
+	return nil
+}
 
+func authenticateV3Message(packet []byte, result *SnmpPacket, securityParameters SnmpV3SecurityParameters) error {
+	authentic, err := securityParameters.isAuthentic(packet, result)
+	if err != nil {
+		return err
+	}
+	if !authentic {
+		return errors.New("incoming packet is not authentic, discarding")
+	}
 	return nil
 }
 
@@ -225,7 +225,7 @@ func (x *GoSNMP) storeSecurityParameters(result *SnmpPacket) error {
 		return fmt.Errorf("connection security model does not match security model extracted from packet")
 	}
 
-	if x.engineIDChanged(result) {
+	if engineIDChanged(x.SecurityParameters, result.SecurityParameters) {
 		return fmt.Errorf("%w: response is from a different authoritative engine than the session's", ErrUnknownEngineID)
 	}
 
@@ -236,19 +236,12 @@ func (x *GoSNMP) storeSecurityParameters(result *SnmpPacket) error {
 	return x.SecurityParameters.setSecurityParameters(result.SecurityParameters)
 }
 
-// engineIDChanged reports whether an incoming message carries an
-// authoritative engine ID other than the one the session has established.
-// Only engine discovery, while the session's engine ID is empty, may set it.
-func (x *GoSNMP) engineIDChanged(result *SnmpPacket) bool {
-	if x.Version != Version3 {
-		return false
-	}
-	usp, ok := x.SecurityParameters.(*UsmSecurityParameters)
-	if !ok || usp.AuthoritativeEngineID == "" {
-		return false
-	}
-	rsp, ok := result.SecurityParameters.(*UsmSecurityParameters)
-	return ok && rsp.AuthoritativeEngineID != usp.AuthoritativeEngineID
+// An empty expected engine ID permits learning the peer's ID during discovery.
+func engineIDChanged(expected, received SnmpV3SecurityParameters) bool {
+	requestUSM, requestOK := expected.(*UsmSecurityParameters)
+	replyUSM, replyOK := received.(*UsmSecurityParameters)
+	return requestOK && replyOK && requestUSM.AuthoritativeEngineID != "" &&
+		replyUSM.AuthoritativeEngineID != requestUSM.AuthoritativeEngineID
 }
 
 // update packet security parameters to match connection security parameters
