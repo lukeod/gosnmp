@@ -338,10 +338,22 @@ sendRetry:
 			}
 
 			unauthenticated := false
+			established := true
+			requestLevel := packetOut.MsgFlags & AuthPriv
+			var receivedLevel SnmpV3MsgFlags
 			if x.Version == Version3 {
+				// RFC 3412 section 7.2 step 5: the security level of an
+				// incoming message comes from its own msgFlags, and privacy
+				// without authentication is not a valid level.
+				receivedLevel = result.MsgFlags & AuthPriv
+				if receivedLevel == AuthPriv&^AuthNoPriv {
+					x.Logger.Print("ERROR v3 message with privacy but no authentication discarded")
+					continue
+				}
 				useResponseSecurityParameters := false
 				if usp, ok := x.SecurityParameters.(*UsmSecurityParameters); ok {
 					if usp.AuthoritativeEngineID == "" {
+						established = false
 						useResponseSecurityParameters = true
 						// Until the engine ID is known, testAuthentication trusts
 						// the response's own msgFlags, so only an engine discovery
@@ -349,10 +361,16 @@ sendRetry:
 						unauthenticated = usp.checkAuthenticated(result.MsgFlags) != nil
 					}
 				}
-				err = x.testAuthentication(resp, result, useResponseSecurityParameters)
-				if err != nil {
-					x.Logger.Printf("ERROR on Test Authentication on v3: %s", err)
-					break
+				if established && receivedLevel&AuthNoPriv == 0 {
+					// Nothing to verify. Only a Report may arrive below the
+					// request's security level (step 11), and it is not trusted.
+					unauthenticated = requestLevel&AuthNoPriv != 0
+				} else {
+					err = x.testAuthentication(resp, result, useResponseSecurityParameters)
+					if err != nil {
+						x.Logger.Printf("ERROR on Test Authentication on v3: %s", err)
+						break
+					}
 				}
 				resp, cursor, err = x.decryptPacket(resp, cursor, result)
 				if err != nil {
@@ -374,6 +392,13 @@ sendRetry:
 			// engine the request was sent to.
 			if result.PDUType != Report && x.engineIDChanged(result) {
 				x.Logger.Printf("ERROR %s from a different authoritative engine discarded", result.PDUType)
+				continue
+			}
+			// RFC 3412 section 7.2 step 12: anything but a Report must come
+			// back at the security level of the request.
+			if x.Version == Version3 && result.PDUType != Report && receivedLevel != requestLevel {
+				x.Logger.Printf("ERROR %s at security level %s for a %s request discarded",
+					result.PDUType, receivedLevel, requestLevel)
 				continue
 			}
 			if result.Error == NoError && len(result.Variables) < 1 {
@@ -403,10 +428,18 @@ sendRetry:
 				case usmStatsUnsupportedSecLevels:
 					return result, ErrUnknownSecurityLevel
 				case usmStatsNotInTimeWindows:
+					if unauthenticated && established {
+						// Its engine boots and time are not authenticated, so
+						// don't resend with them.
+						return result, ErrNotInTimeWindow
+					}
 					break waitingResponse
 				case usmStatsUnknownUserNames:
 					return result, ErrUnknownUsername
 				case usmStatsUnknownEngineIDs:
+					if unauthenticated && established {
+						return result, ErrUnknownEngineID
+					}
 					break waitingResponse
 				case usmStatsWrongDigests:
 					return result, ErrWrongDigest
@@ -421,6 +454,12 @@ sendRetry:
 				default:
 					return result, ErrUnknownReportPDU
 				}
+			}
+			if unauthenticated && established {
+				// A Report that can't be classified above would be returned
+				// and its security parameters stored.
+				x.Logger.Printf("ERROR unauthenticated %s discarded", result.PDUType)
+				continue
 			}
 
 			// A v3 REPORT is matched by msgID alone, checked above. Otherwise the
