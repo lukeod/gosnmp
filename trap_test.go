@@ -240,11 +240,21 @@ SANITY:
 	}
 }
 
-func TestGetTrapIdentifierReturnsHeaderError(t *testing.T) {
-	gs := newTestGoSNMP()
-	identifier, err := gs.getTrapIdentifier(nil)
-	require.ErrorContains(t, err, "cannot unmarshal empty packet")
-	require.Empty(t, identifier)
+func TestUnmarshalTrapWithCredentialTableReturnsHeaderError(t *testing.T) {
+	gs := newTestGoSNMPv3(AuthNoPriv, nil)
+	usmMap := NewSnmpV3SecurityParametersTable(gs.Logger)
+	sp := secParamsList[0]
+	require.NoError(t, usmMap.Add(sp.UserName, sp.Copy()))
+	gs.SetTrapSecurityParametersTable(usmMap)
+
+	buf := genericV3Trap()
+	const msgFlagsOffset = 21
+	require.Equal(t, byte(AuthNoPriv), buf[msgFlagsOffset])
+	buf[msgFlagsOffset] = byte(AuthPriv &^ AuthNoPriv)
+
+	result, err := gs.UnmarshalTrap(buf, true)
+	require.ErrorIs(t, err, errInvalidMsgFlags)
+	require.Nil(t, result)
 }
 
 func TestUnmarshalTrapWithMultipleUsers(t *testing.T) {

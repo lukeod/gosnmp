@@ -546,16 +546,17 @@ func TestV3HarnessTCPFraming(t *testing.T) {
 // below an authenticated request's level, or one without varbinds, is
 // discarded and the request keeps waiting for its reply.
 
-// setV3MsgFlags returns a copy of a marshaled v3 message with its msgFlags
-// octet replaced, for flag combinations the marshaling code won't produce.
+// replaceV3MsgFlags returns a copy of a marshaled v3 message with its msgFlags
+// tag and value replaced, for fields the marshaling code won't produce.
 // The msgFlags field is the one-octet OCTET STRING followed by the USM
 // msgSecurityModel INTEGER in msgGlobalData.
-func setV3MsgFlags(t *testing.T, msg []byte, flags SnmpV3MsgFlags) []byte {
+func replaceV3MsgFlags(t *testing.T, msg []byte, tag Asn1BER, flags SnmpV3MsgFlags) []byte {
 	t.Helper()
 	out := append([]byte(nil), msg...)
 	for i := 0; i+6 <= len(out); i++ {
 		if out[i] == byte(OctetString) && out[i+1] == 1 &&
 			bytes.Equal(out[i+3:i+6], []byte{byte(Integer), 1, byte(UserSecurityModel)}) {
+			out[i] = byte(tag)
 			out[i+2] = byte(flags)
 			return out
 		}
@@ -721,7 +722,7 @@ func TestV3SeclevelVerifiesClaimedAuthentication(t *testing.T) {
 				func(req *v3TestAgentRequest) [][]byte {
 					out := report(req)
 					if tc.claimAuth && len(out) > 0 {
-						out[0] = setV3MsgFlags(t, out[0], AuthNoPriv)
+						out[0] = replaceV3MsgFlags(t, out[0], OctetString, AuthNoPriv)
 					}
 					return out
 				},
@@ -803,29 +804,44 @@ func TestV3SeclevelAuthPrivRejectsAuthNoPrivResponse(t *testing.T) {
 	requireRequestCount(t, agent, 1)
 }
 
-// TestV3SeclevelRejectsPrivWithoutAuth checks that a response whose msgFlags
-// ask for privacy without authentication is discarded before USM decodes it,
-// and that the valid reply that follows completes the same attempt.
-func TestV3SeclevelRejectsPrivWithoutAuth(t *testing.T) {
-	agent := newV3TestAgent(t, v3HarnessEngineID, v3HarnessBoots, v3HarnessTime, v3TestAgentCreds{username: v3HarnessUser})
-	sysDescr := v3AgentSysDescr(agent)
-	agent.steps = []v3TestAgentStep{func(req *v3TestAgentRequest) [][]byte {
-		out := sysDescr(req)
-		if len(out) != 1 {
-			return out
-		}
-		return [][]byte{setV3MsgFlags(t, out[0], AuthPriv&^AuthNoPriv), out[0]}
-	}}
-	port := agent.startUDP(t)
+// TestV3SeclevelDiscardsInvalidMsgFlags checks that a valid reply can complete
+// the same attempt after a reply with invalid msgFlags is discarded.
+func TestV3SeclevelDiscardsInvalidMsgFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		tag   Asn1BER
+		flags SnmpV3MsgFlags
+	}{
+		{"privacy without authentication", OctetString, AuthPriv &^ AuthNoPriv},
+		{"wrong field type", Integer, NoAuthNoPriv},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := newV3TestAgent(t, v3HarnessEngineID, v3HarnessBoots, v3HarnessTime, v3TestAgentCreds{username: v3HarnessUser})
+			sysDescr := v3AgentSysDescr(agent)
+			agent.steps = []v3TestAgentStep{func(req *v3TestAgentRequest) [][]byte {
+				out := agent.reply(req, v3TestAgentReply{pduType: GetResponse, vars: []SnmpPDU{{
+					Name:  v3HarnessSysDescrOID,
+					Value: "discarded reply",
+					Type:  OctetString,
+				}}})
+				if len(out) != 1 {
+					return out
+				}
+				out[0] = replaceV3MsgFlags(t, out[0], tc.tag, tc.flags)
+				return append(out, sysDescr(req)...)
+			}}
+			port := agent.startUDP(t)
 
-	gs, sp := newV3HarnessClient(port, NoAuthNoPriv, agent.creds)
-	v3SeclevelSeedSession(sp)
-	v3HarnessConnect(t, gs)
+			gs, sp := newV3HarnessClient(port, NoAuthNoPriv, agent.creds)
+			v3SeclevelSeedSession(sp)
+			v3HarnessConnect(t, gs)
 
-	result, err := gs.Get([]string{v3HarnessSysDescrOID})
-	require.NoError(t, err)
-	requireSysDescrResult(t, result)
-	requireRequestCount(t, agent, 1)
+			result, err := gs.Get([]string{v3HarnessSysDescrOID})
+			require.NoError(t, err)
+			requireSysDescrResult(t, result)
+			requireRequestCount(t, agent, 1)
+		})
+	}
 }
 
 // wrappedUSM is a caller's own SnmpV3SecurityParameters built on USM.
