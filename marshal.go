@@ -329,21 +329,13 @@ sendRetry:
 
 			var cursor int
 			cursor, err = x.unmarshalHeaderWithAuthRequirement(resp, result, requireAuthFlag)
-			if errors.Is(err, errInvalidMsgFlags) || errors.Is(err, errUnauthenticatedResponse) {
-				// Discard the message and keep waiting on the same attempt.
-				x.Logger.Printf("ERROR response discarded: %s", err)
-				err = nil
-				continue
-			}
-			if err != nil && requireAuthFlag {
-				// Nothing in the message is authenticated yet, so a decoding
-				// error, such as a USM failure for another engine's parameters,
-				// can't end an authenticated request either.
-				x.Logger.Printf("ERROR response discarded: %s", err)
-				err = nil
-				continue
-			}
 			if err != nil {
+				// An undecodable signed reply cannot complete any v3 request.
+				claimsAuth := x.Version == Version3 && result.MsgFlags&AuthNoPriv != 0
+				if requireAuthFlag || claimsAuth || errors.Is(err, errInvalidMsgFlags) {
+					x.Logger.Printf("ERROR response discarded: %s", err)
+					continue
+				}
 				x.Logger.Printf("ERROR on unmarshall header: %s", err)
 				break
 			}
@@ -366,16 +358,11 @@ sendRetry:
 					// whatever level the session itself is configured for.
 					err = x.verifyReceivedAuthentication(resp, result)
 				}
-				if err != nil && requireAuthFlag {
-					// RFC 3414 section 3.2 step 6: a message that fails
-					// authentication is discarded; keep waiting for the reply.
-					x.Logger.Printf("ERROR response discarded: %s", err)
-					err = nil
-					continue
-				}
 				if err != nil {
-					x.Logger.Printf("ERROR on Test Authentication on v3: %s", err)
-					break
+					// RFC 3412 section 7.2 step 6(b): discard the message on
+					// authentication failure and keep waiting for the response.
+					x.Logger.Printf("ERROR response discarded: %s", err)
+					continue
 				}
 				resp, cursor, err = x.decryptPacket(resp, cursor, result)
 				if err != nil {

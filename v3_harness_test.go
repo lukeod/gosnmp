@@ -69,6 +69,14 @@ func newV3HarnessClient(port uint16, flags SnmpV3MsgFlags, creds v3TestAgentCred
 	return gs, sp
 }
 
+// v3HarnessSeedSession sets up an established session for the agent's local context.
+func v3HarnessSeedSession(gs *GoSNMP, sp *UsmSecurityParameters, boots, engineTime uint32) {
+	gs.ContextEngineID = v3HarnessEngineID
+	sp.AuthoritativeEngineID = v3HarnessEngineID
+	sp.AuthoritativeEngineBoots = boots
+	sp.AuthoritativeEngineTime = engineTime
+}
+
 func v3HarnessConnect(t *testing.T, gs *GoSNMP) {
 	t.Helper()
 	require.NoError(t, gs.Connect())
@@ -154,18 +162,27 @@ func requireSysDescrResult(t *testing.T, result *SnmpPacket) {
 	require.Equal(t, []byte(v3HarnessSysDescrValue), result.Variables[0].Value)
 }
 
-// TestV3HarnessColdStartGetAuthNoPriv pins the full cold-start flow:
-// blank discovery probe, usmStatsUnknownEngineIDs REPORT, engine parameter
-// adoption, authenticated GetRequest, GetResponse.
+// TestV3HarnessColdStartGetAuthNoPriv checks that a blank discovery probe
+// ignores a signed Report it cannot verify, learns the engine ID from the
+// discovery Report that follows, and completes an authenticated GET.
 func TestV3HarnessColdStartGetAuthNoPriv(t *testing.T) {
 	agent := newV3TestAgent(t, v3HarnessEngineID, v3HarnessBoots, v3HarnessTime, v3HarnessCredsAuthNoPriv())
+	discoveryReport := v3AgentUnknownEngineIDsReport(agent)
 	agent.steps = []v3TestAgentStep{
-		v3AgentUnknownEngineIDsReport(agent),
+		func(req *v3TestAgentRequest) [][]byte {
+			signed := agent.reply(req, v3TestAgentReply{
+				pduType: Report,
+				vars:    []SnmpPDU{{Name: usmStatsUnsupportedSecLevels, Type: Counter32, Value: uint32(1)}},
+			})
+			return append(signed, discoveryReport(req)...)
+		},
 		v3AgentSysDescr(agent),
 	}
 	port := agent.startUDP(t)
 
 	gs, sp := newV3HarnessClient(port, AuthNoPriv, agent.creds)
+	var received int
+	gs.OnRecv = func(*GoSNMP) { received++ }
 	v3HarnessConnect(t, gs)
 	v3UnknownEngineIDsReportFixture.seedIDs(gs)
 
@@ -174,11 +191,11 @@ func TestV3HarnessColdStartGetAuthNoPriv(t *testing.T) {
 	requireSysDescrResult(t, result)
 
 	// The engine ID from the discovery REPORT is adopted into the session.
-	// Boots/time seeding from this REPORT is deliberately not asserted: the
-	// REPORT is unauthenticated, and tightened timeliness handling may stop
-	// trusting it without changing the observable flow pinned here.
+	// The agent checks the GET's HMAC and accepts it without a timeliness
+	// check. This two-exchange script leaves its boots/time unasserted.
 	require.Equal(t, v3HarnessEngineID, sp.AuthoritativeEngineID)
 
+	require.Equal(t, 3, received)
 	require.Equal(t, 2, agent.requestCount())
 	probe, get := agent.request(0), agent.request(1)
 
@@ -594,6 +611,26 @@ func requireV3SeclevelStateKept(t *testing.T, sp *UsmSecurityParameters) {
 	requireEngineTimeNear(t, v3HarnessTime, sp.AuthoritativeEngineTime)
 }
 
+// Check engine state before processing the second reply. A successful
+// GET stores the reply's engine parameters and could mask an earlier update.
+func requireV3ReplyDiscarded(t *testing.T, gs *GoSNMP, sp *UsmSecurityParameters, agent *v3TestAgent) {
+	t.Helper()
+	received := 0
+	gs.OnRecv = func(*GoSNMP) {
+		received++
+		if received == 2 {
+			requireV3SeclevelStateKept(t, sp)
+		}
+	}
+
+	result, err := gs.Get([]string{v3HarnessSysDescrOID})
+	require.NoError(t, err)
+	requireSysDescrResult(t, result)
+	require.Equal(t, 2, received)
+	require.Equal(t, 1, agent.requestCount())
+	requireV3SeclevelStateKept(t, sp)
+}
+
 // TestV3SeclevelUnauthenticatedReportIsDiscarded checks that a noAuthNoPriv
 // Report can't end an authenticated request, whatever it reports: it is
 // discarded, the reply that follows completes the same attempt, and the
@@ -764,55 +801,65 @@ func TestV3SeclevelEmptyReportIsDiscarded(t *testing.T) {
 // when it is signed with another key, or when the session has no key at all
 // to check it with.
 func TestV3SeclevelVerifiesClaimedAuthentication(t *testing.T) {
-	notInTimeWindow := []SnmpPDU{{Name: usmStatsNotInTimeWindows, Type: Counter32, Value: uint32(1)}}
 	for _, tc := range []struct {
 		name        string
 		clientCreds v3TestAgentCreds
-		agentCreds  v3TestAgentCreds
-		// claimAuth sets the authentication flag on an unsigned Report.
-		claimAuth bool
-		// wantErr is where the Report is stopped: the digest check, or the
-		// USM decoder for a user without an authentication protocol.
-		wantErr string
+		wantErr     string
 	}{
 		{
 			name:        "wrong key",
 			clientCreds: v3TestAgentCreds{username: v3HarnessUser, authProto: SHA, authPass: "not-the-agents-key"},
-			agentCreds:  v3HarnessCredsAuthNoPriv(),
 			wantErr:     "incoming packet is not authentic",
 		},
 		{
-			name:        "no key",
+			name:        "no authentication protocol",
 			clientCreds: v3TestAgentCreds{username: v3HarnessUser},
-			agentCreds:  v3TestAgentCreds{username: v3HarnessUser},
-			claimAuth:   true,
 			wantErr:     "authentication parameters are not configured",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			agent := newV3TestAgent(t, v3HarnessEngineID, v3HarnessBoots, v3HarnessTime, tc.agentCreds)
-			report := v3SeclevelReportThenSysDescr(agent, v3TestAgentReply{vars: notInTimeWindow})
-			agent.steps = []v3TestAgentStep{
-				func(req *v3TestAgentRequest) [][]byte {
-					out := report(req)
-					if tc.claimAuth && len(out) > 0 {
-						out[0] = setV3MsgFlags(t, out[0], AuthNoPriv)
-					}
-					return out
-				},
-				v3AgentSysDescr(agent),
-			}
+			agent := newV3TestAgent(t, v3HarnessEngineID, v3HarnessBoots, v3HarnessTime, v3HarnessCredsAuthNoPriv())
+			ids := &SnmpPacket{MsgID: 17, RequestID: 23}
+			boots, engineTime := uint32(99), uint32(5)
+			report := agent.reply(&v3TestAgentRequest{Packet: ids}, v3TestAgentReply{
+				pduType:    Report,
+				vars:       []SnmpPDU{{Name: usmStatsNotInTimeWindows, Type: Counter32, Value: uint32(1)}},
+				boots:      &boots,
+				engineTime: &engineTime,
+			})
+			require.Len(t, report, 1)
+			sysDescr := v3AgentSysDescr(agent)
+			agent.steps = []v3TestAgentStep{func(req *v3TestAgentRequest) [][]byte {
+				return append(report, sysDescr(req)...)
+			}}
 			port := agent.startUDP(t)
 
 			gs, sp := newV3HarnessClient(port, NoAuthNoPriv, tc.clientCreds)
-			v3SeclevelSeedSession(sp)
+			v3HarnessSeedSession(gs, sp, v3HarnessBoots, v3HarnessTime)
 			v3HarnessConnect(t, gs)
+			gs.SetMsgID(ids.MsgID - 1)
+			gs.SetRequestID(ids.RequestID - 1)
 
-			result, err := gs.Get([]string{v3HarnessSysDescrOID})
+			// Header decoding clears the digest field. Preserve the Report for the GET.
+			require.NoError(t, sp.InitSecurityKeys())
+			msg := bytes.Clone(report[0])
+			result := &SnmpPacket{SecurityParameters: sp.Copy(), Logger: gs.Logger}
+			_, err := gs.unmarshalHeader(msg, result)
+			if tc.clientCreds.authProto > NoAuth {
+				require.NoError(t, err)
+				err = gs.verifyReceivedAuthentication(msg, result)
+			}
 			require.ErrorContains(t, err, tc.wantErr)
-			require.Nil(t, result)
-			requireRequestCount(t, agent, 1)
-			requireV3SeclevelStateKept(t, sp)
+
+			// Only the Report claims authentication during the GET.
+			credentials := &wrappedUSM{UsmSecurityParameters: sp}
+			gs.SecurityParameters = credentials
+			requireV3ReplyDiscarded(t, gs, sp, agent)
+			request := agent.request(0).Packet
+			require.Equal(t, ids.MsgID, request.MsgID)
+			require.Equal(t, ids.RequestID, request.RequestID)
+			require.Equal(t, tc.clientCreds.authProto > NoAuth, credentials.checkedDigest,
+				"digest verification during the GET")
 		})
 	}
 }
@@ -915,8 +962,15 @@ func TestV3SeclevelRejectsPrivWithoutAuth(t *testing.T) {
 	requireRequestCount(t, agent, 1)
 }
 
-// wrappedUSM is a caller's own SnmpV3SecurityParameters built on USM.
-type wrappedUSM struct{ *UsmSecurityParameters }
+type wrappedUSM struct {
+	*UsmSecurityParameters
+	checkedDigest bool
+}
+
+func (w *wrappedUSM) isAuthentic(message []byte, packet *SnmpPacket) (bool, error) {
+	w.checkedDigest = true
+	return w.UsmSecurityParameters.isAuthentic(message, packet)
+}
 
 // TestV3SeclevelVerifiesThroughTheInterface checks that an authenticated
 // reply is verified through the SnmpV3SecurityParameters interface, so a type
@@ -927,14 +981,16 @@ func TestV3SeclevelVerifiesThroughTheInterface(t *testing.T) {
 	port := agent.startUDP(t)
 
 	gs, sp := newV3HarnessClient(port, AuthNoPriv, agent.creds)
-	v3SeclevelSeedSession(sp)
-	gs.SecurityParameters = &wrappedUSM{sp}
+	v3HarnessSeedSession(gs, sp, v3HarnessBoots, v3HarnessTime)
+	credentials := &wrappedUSM{UsmSecurityParameters: sp}
+	gs.SecurityParameters = credentials
 	v3HarnessConnect(t, gs)
 
 	result, err := gs.Get([]string{v3HarnessSysDescrOID})
 	require.NoError(t, err)
 	requireSysDescrResult(t, result)
-	requireRequestCount(t, agent, 1)
+	require.True(t, credentials.checkedDigest, "the session wrapper must verify the reply")
+	require.Equal(t, 1, agent.requestCount())
 }
 
 // TestV3SeclevelAuthPrivHonoursAuthenticatedReport checks that an
