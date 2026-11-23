@@ -675,35 +675,43 @@ func TestV3SeclevelUnauthenticatedReportIsDiscarded(t *testing.T) {
 // is discarded instead of ending the GET, whether it is unsigned or claims
 // authentication.
 func TestV3SeclevelDiscardsReportWithLocalizedKey(t *testing.T) {
-	noAuth := NoAuthNoPriv
-	for _, tc := range []struct {
-		name     string
-		msgFlags *SnmpV3MsgFlags // nil keeps the agent's authNoPriv level
-	}{
-		{name: "unsigned", msgFlags: &noAuth},
-		{name: "claims authentication"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, flags := range []SnmpV3MsgFlags{NoAuthNoPriv, AuthNoPriv} {
+		t.Run(flags.String(), func(t *testing.T) {
 			agent := newV3TestAgent(t, v3HarnessEngineID, v3HarnessBoots, v3HarnessTime, v3HarnessCredsAuthNoPriv())
-			otherEngineID := v3HarnessEngineID + "-new"
-			agent.steps = []v3TestAgentStep{v3SeclevelReportThenSysDescr(agent, v3TestAgentReply{
-				vars:                  []SnmpPDU{{Name: usmStatsUnknownEngineIDs, Type: Counter32, Value: uint32(1)}},
-				msgFlags:              tc.msgFlags,
-				authoritativeEngineID: &otherEngineID,
-			})}
+			other := newV3TestAgent(t, v3HarnessEngineID+"-new", 99, 5, agent.creds)
+			ids := &SnmpPacket{MsgID: 17, RequestID: 23}
+			report := other.reply(&v3TestAgentRequest{Packet: ids}, v3TestAgentReply{
+				pduType:  Report,
+				vars:     []SnmpPDU{{Name: usmStatsUnknownEngineIDs, Type: Counter32, Value: uint32(1)}},
+				msgFlags: &flags,
+			})
+			require.Len(t, report, 1)
+
+			// Parsing with the passphrase verifies the signed Report's digest
+			// using the key localized to the engine named on the wire.
+			packet, err := agent.parse(report[0])
+			require.NoError(t, err)
+			require.Equal(t, flags, packet.MsgFlags)
+			require.Equal(t, other.engineID, packet.SecurityParameters.(*UsmSecurityParameters).AuthoritativeEngineID)
+
+			sysDescr := v3AgentSysDescr(agent)
+			agent.steps = []v3TestAgentStep{func(req *v3TestAgentRequest) [][]byte {
+				return append(report, sysDescr(req)...)
+			}}
 			port := agent.startUDP(t)
 
 			gs, sp := newV3HarnessClient(port, AuthNoPriv, agent.creds)
-			v3SeclevelSeedSession(sp)
+			v3HarnessSeedSession(gs, sp, v3HarnessBoots, v3HarnessTime)
 			require.NoError(t, sp.InitSecurityKeys())
 			sp.AuthenticationPassphrase = ""
 			v3HarnessConnect(t, gs)
+			gs.SetMsgID(ids.MsgID - 1)
+			gs.SetRequestID(ids.RequestID - 1)
 
-			result, err := gs.Get([]string{v3HarnessSysDescrOID})
-			require.NoError(t, err)
-			requireSysDescrResult(t, result)
-			requireRequestCount(t, agent, 1)
-			requireV3SeclevelStateKept(t, sp)
+			requireV3ReplyDiscarded(t, gs, sp, agent)
+			request := agent.request(0).Packet
+			require.Equal(t, request.MsgID, packet.MsgID)
+			require.Equal(t, request.RequestID, packet.RequestID)
 		})
 	}
 }
@@ -862,6 +870,22 @@ func TestV3SeclevelVerifiesClaimedAuthentication(t *testing.T) {
 				"digest verification during the GET")
 		})
 	}
+}
+
+func TestV3HeaderRejectsUnsignedReportBeforeUSM(t *testing.T) {
+	msg, err := v3UnknownEngineIDsReportFixture.decode()
+	require.NoError(t, err)
+
+	gs, sp := newV3HarnessClient(0, AuthNoPriv, v3HarnessCredsAuthNoPriv())
+	knownEngineID := v3HarnessEngineID + "-other"
+	sp.AuthoritativeEngineID = knownEngineID
+	require.NoError(t, sp.InitSecurityKeys())
+	sp.AuthenticationPassphrase = ""
+
+	result := &SnmpPacket{SecurityParameters: sp, Logger: gs.Logger}
+	_, err = gs.unmarshalHeaderWithAuthRequirement(msg, result, true)
+	require.ErrorIs(t, err, errUnauthenticatedResponse)
+	require.Equal(t, knownEngineID, sp.AuthoritativeEngineID)
 }
 
 // TestV3HeaderRejectsMalformedMsgFlags checks that msgFlags must be a
