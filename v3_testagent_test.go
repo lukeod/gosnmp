@@ -332,11 +332,8 @@ func (a *v3TestAgent) securityLevel() SnmpV3MsgFlags {
 	}
 }
 
-// v3TestAgentReply describes a conforming response built by reply(). Nil
-// override fields fall back to echoing the request (msgID, requestID) or to
-// the agent's state (engine IDs, boots, engineTime); pointers keep zero and
-// empty strings expressible, e.g. a Response carrying request-id 0 or a
-// discovery REPORT carrying an empty context engine ID.
+// v3TestAgentReply overrides fields in a scripted reply. Pointers allow
+// explicit zero values, such as a Report with request-id zero.
 type v3TestAgentReply struct {
 	pduType               PDUType
 	vars                  []SnmpPDU
@@ -346,12 +343,12 @@ type v3TestAgentReply struct {
 	contextEngineID       *string
 	boots                 *uint32
 	engineTime            *uint32
-	msgFlags              *SnmpV3MsgFlags // security level to reply at instead of the user's
+	msgFlags              *SnmpV3MsgFlags
 }
 
-// reply echoes the request identifiers and defaults ordinary responses to
-// the request's security level. Reports default to the agent's security level.
-// Marshal failures are reported through the error channel.
+// reply echoes the request identifiers. Ordinary responses also echo the
+// scoped context and security level. Reports default to the agent's context
+// and security level. Marshal failures are reported through the error channel.
 func (a *v3TestAgent) reply(req *v3TestAgentRequest, r v3TestAgentReply) [][]byte {
 	msgID := req.Packet.MsgID
 	if r.msgID != nil {
@@ -366,6 +363,13 @@ func (a *v3TestAgent) reply(req *v3TestAgentRequest, r v3TestAgentReply) [][]byt
 		authoritativeEngineID = *r.authoritativeEngineID
 	}
 	contextEngineID := a.engineID
+	contextName := ""
+	msgFlags := a.securityLevel()
+	if r.pduType == GetResponse {
+		contextEngineID = req.Packet.ContextEngineID
+		contextName = req.Packet.ContextName
+		msgFlags = req.Packet.MsgFlags & AuthPriv
+	}
 	if r.contextEngineID != nil {
 		contextEngineID = *r.contextEngineID
 	}
@@ -388,10 +392,6 @@ func (a *v3TestAgent) reply(req *v3TestAgentRequest, r v3TestAgentReply) [][]byt
 		PrivacyKey:               a.privacyKey,
 		Logger:                   a.logger,
 	}
-	msgFlags := a.securityLevel()
-	if r.pduType == GetResponse {
-		msgFlags = req.Packet.MsgFlags & AuthPriv
-	}
 	if r.msgFlags != nil {
 		msgFlags = *r.msgFlags
 	}
@@ -409,6 +409,7 @@ func (a *v3TestAgent) reply(req *v3TestAgentRequest, r v3TestAgentReply) [][]byt
 		MsgID:              msgID,
 		RequestID:          requestID,
 		ContextEngineID:    contextEngineID,
+		ContextName:        contextName,
 		Logger:             a.logger,
 		Variables:          r.vars,
 	}
